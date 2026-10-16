@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Map as MLMap, Popup, NavigationControl, ScaleControl, setWorkerUrl } from 'maplibre-gl'
+import { Map as MLMap, Marker, Popup, NavigationControl, ScaleControl, setWorkerUrl } from 'maplibre-gl'
 import type { StyleSpecification, GeoJSONSource, MapMouseEvent, MapLayerMouseEvent } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import * as turf from '@turf/turf'
@@ -244,6 +244,77 @@ const PM_BANDS = [
 ]
 const pmBand = (v: number) => PM_BANDS.find((b) => v <= b.max) ?? PM_BANDS[PM_BANDS.length - 1]
 
+/* ------------- Data per jam (WIB): kemarin 00:00 s/d besok 23:00 -------------
+   Angin   : Open-Meteo Forecast API (model cuaca global, 10 m, km/j)
+   Polusi  : Open-Meteo Air Quality API, domain CAMS Global (Copernicus/ECMWF, ±45 km)
+   Keduanya diminta untuk grid yang sama (GRID_Q) dengan zona waktu Asia/Jakarta. */
+type WindH = { t: string[]; w: WindPt[][] }
+type AqH = { t: string[]; d: AqData[] }
+const PAST_DAYS = 1, FWD_DAYS = 2
+const HOURLY_Q = `&timezone=Asia%2FJakarta&past_days=${PAST_DAYS}&forecast_days=${FWD_DAYS}`
+const NO_WIND: WindPt[] = []
+const nowKey = () => {
+  const s = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Jakarta', hourCycle: 'h23' })
+  return `${s.slice(0, 10)}T${s.slice(11, 13)}:00`
+}
+const hh = (k: string) => `${k.slice(11, 13)}:00`
+const dayLabel = (k: string) =>
+  new Date(`${k.slice(0, 10)}T00:00:00Z`).toLocaleDateString('id-ID', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' })
+
+type WindRaw = { t: string[]; s: number[][]; d: number[][] } // [jam][titik grid]
+async function fetchWindRaw(): Promise<WindRaw> {
+  const r = await fetch(`https://api.open-meteo.com/v1/forecast?${GRID_Q}&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=kmh${HOURLY_Q}`)
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  const j = await r.json()
+  const arr: any[] = Array.isArray(j) ? j : [j]
+  if (arr.length !== NX * NY) throw new Error('grid tidak lengkap')
+  const t: string[] = arr[0].hourly.time
+  return {
+    t,
+    s: t.map((_, h) => arr.map((a) => Math.round((a.hourly.wind_speed_10m[h] ?? 0) * 10) / 10)),
+    d: t.map((_, h) => arr.map((a) => Math.round(a.hourly.wind_direction_10m[h] ?? 0))),
+  }
+}
+const toWindH = (c: WindRaw): WindH => ({
+  t: c.t,
+  w: c.t.map((_, h) => GRID_PTS.map((p, i) => ({ lon: p.lo, lat: p.la, speed: c.s[h][i], dir: c.d[h][i] }))),
+})
+
+type AqRaw = { t: string[]; v: Record<AqKey, number[][]> }
+const AQ_API: Record<AqKey, string> = { pm25: 'pm2_5', pm10: 'pm10', dust: 'dust', aod: 'aerosol_optical_depth' }
+async function fetchAqRaw(): Promise<AqRaw> {
+  const r = await fetch(`https://air-quality-api.open-meteo.com/v1/air-quality?${GRID_Q}&hourly=pm2_5,pm10,dust,aerosol_optical_depth&domains=cams_global${HOURLY_Q}`)
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  const j = await r.json()
+  const arr: any[] = Array.isArray(j) ? j : [j]
+  if (arr.length !== NX * NY) throw new Error('grid tidak lengkap')
+  const t: string[] = arr[0].hourly.time
+  const v = {} as Record<AqKey, number[][]>
+  ;(Object.keys(AQ_API) as AqKey[]).forEach((k) => {
+    const q = k === 'aod' ? 100 : 10
+    v[k] = t.map((_, h) => arr.map((a) => Math.round((a.hourly[AQ_API[k]]?.[h] ?? 0) * q) / q))
+  })
+  return { t, v }
+}
+const toAqH = (c: AqRaw): AqH => ({
+  t: c.t,
+  d: c.t.map((_, h) => {
+    const o = {} as AqData
+    ;(Object.keys(c.v) as AqKey[]).forEach((k) => (o[k] = Float32Array.from(c.v[k][h])))
+    return o
+  }),
+})
+
+async function cached<T>(key: string, load: () => Promise<T>, maxAge = 25 * 60 * 1000): Promise<T> {
+  try {
+    const c = JSON.parse(localStorage.getItem(key) || 'null')
+    if (c && c.p && Date.now() - c.ts < maxAge) return c.p as T
+  } catch { /* abaikan */ }
+  const p = await load()
+  try { localStorage.setItem(key, JSON.stringify({ ts: Date.now(), p })) } catch { /* abaikan */ }
+  return p
+}
+
 /* warna asap hasil simulasi plume: kerapatan → peach → magenta → ungu tua (mirip Fire Emissions Watch) */
 const SMOKE_STOPS = [[0, 255, 200, 170, 0], [0.06, 255, 205, 175, 45], [0.3, 255, 140, 110, 105], [0.7, 240, 70, 140, 150], [1.3, 190, 40, 170, 190], [2.2, 110, 20, 150, 215], [3, 60, 10, 110, 235]]
 function buildSmokeLut(): Uint32Array {
@@ -285,7 +356,7 @@ function toWib(date: string, time: string): string {
 
 function popupHtml(p: any, w: WindPt | null, pm: number | null): string {
   const dn = p.daynight === 'D' ? 'Siang' : p.daynight === 'N' ? 'Malam' : '-'
-  return `<div class="pop"><b>🔥 Titik panas</b>
+  return `<div class="pop"><b>Titik panas</b>
     <div class="pop-row"><span>Wilayah</span><b>${p._place || p._region}</b></div>
     <div class="pop-row"><span>Waktu</span><b>${toWib(p.acq_date, p.acq_time)}</b></div>
     <div class="pop-row"><span>Satelit</span><b>${p.satellite}</b></div>
@@ -299,14 +370,27 @@ function popupHtml(p: any, w: WindPt | null, pm: number | null): string {
 type Fires = FeatureCollection<Point, Record<string, any>>
 const EMPTY: Fires = { type: 'FeatureCollection', features: [] }
 const EMPTY_FC: FeatureCollection = { type: 'FeatureCollection', features: [] }
+type Proj = 'mercator' | 'globe'
 const INDONESIA: [number, number, number, number] = [94.5, -11.5, 141.5, 6.5]
 
+/* zoom ke batas wilayah; padding menyisakan ruang untuk panel lapisan (kiri) dan kontrol jam (bawah) */
+function fitArea(map: MLMap | null, g: Geo | null, i: number, l: Level) {
+  const b = g?.bb[i]
+  if (!map || !b) return
+  const c = map.getContainer()
+  const wide = c.clientWidth > 760 && c.clientHeight > 520
+  map.fitBounds([[b[0], b[1]], [b[2], b[3]]], {
+    padding: wide ? { top: 70, bottom: 130, left: 250, right: 70 } : 40,
+    duration: 1000, maxZoom: l === 'kota' ? 11 : 9, essential: true,
+  })
+}
+
 type Acc = { n: number; frp: number; high: number; max: number; dates: Record<string, number> }
-type VisKey = 'heat' | 'radius' | 'wind' | 'smoke' | 'aq' | 'points' | 'choro' | 'borders'
-const VIS0: Record<VisKey, boolean> = { heat: true, radius: true, wind: true, smoke: true, aq: true, points: true, choro: true, borders: true }
+type VisKey = 'radius' | 'wind' | 'smoke' | 'trail' | 'aq' | 'points' | 'choro' | 'borders'
+const VIS0: Record<VisKey, boolean> = { radius: true, wind: true, smoke: true, trail: true, aq: true, points: true, choro: true, borders: true }
 const LAYER_LIST: [VisKey, string][] = [
-  ['points', 'Titik api'], ['heat', 'Heatmap panas'], ['radius', 'Radius panas'],
-  ['smoke', 'Plume asap'], ['aq', 'Polusi udara (CAMS)'], ['wind', 'Aliran angin'],
+  ['points', 'Titik api'], ['radius', 'Radius panas'],
+  ['smoke', 'Plume asap'], ['trail', 'Jejak asap per jam'], ['aq', 'Polusi udara (CAMS)'], ['wind', 'Aliran angin'],
   ['borders', 'Batas wilayah'], ['choro', 'Warna per wilayah'],
 ]
 
@@ -342,6 +426,9 @@ export default function App() {
     prov: new Map(), kota: new Map(), maxProv: 1, maxKota: 1,
   })
   const gainRef = useRef(1)
+  const fieldRef = useRef<Field | null>(null)
+  const projRef = useRef<Proj>('mercator')
+  const trailRef = useRef<FeatureCollection>(EMPTY_FC)
 
   const [basemap, setBasemap] = useState(DEFAULT_BASEMAP)
   const [source, setSource] = useState('VIIRS_SNPP_NRT')
@@ -355,10 +442,14 @@ export default function App() {
   const [error, setError] = useState('')
   const [mapWarn, setMapWarn] = useState(CARTO_KEY ? '' : 'VITE_CARTO_KEY belum diisi di .env: peta Carto tampil dengan watermark.')
   const [dbg, setDbg] = useState('')
-  const [wind, setWind] = useState<WindPt[]>([])
+  const [windH, setWindH] = useState<WindH | null>(null)
   const [windErr, setWindErr] = useState('')
-  const [aq, setAq] = useState<AqData | null>(null)
+  const [aqH, setAqH] = useState<AqH | null>(null)
   const [aqErr, setAqErr] = useState('')
+  const [hour, setHour] = useState(nowKey)
+  const [playing, setPlaying] = useState(false)
+  const [proj, setProj] = useState<Proj>('mercator')
+  const [layersOpen, setLayersOpen] = useState(() => window.innerWidth > 900)
   const [aqVar, setAqVar] = useState<AqKey>('pm25')
   const [vis, setVis] = useState<Record<VisKey, boolean>>(VIS0)
   const [smokeGain, setSmokeGain] = useState(1)
@@ -372,6 +463,33 @@ export default function App() {
   const smokeRef = useRef<HTMLCanvasElement>(null)
   const aqCvRef = useRef<HTMLCanvasElement>(null)
   const showDbg = useMemo(() => new URLSearchParams(location.search).has('debug'), [])
+
+  /* jam terpilih → angin & polusi pada jam itu */
+  const times = useMemo(() => windH?.t ?? aqH?.t ?? [], [windH, aqH])
+  const hi = Math.max(0, times.indexOf(hour))
+  const wIdx = windH ? Math.max(0, windH.t.indexOf(hour)) : -1
+  const wind = windH ? windH.w[wIdx] : NO_WIND
+  const hasWind = wind.length === NX * NY
+  const aq = useMemo(() => (aqH ? aqH.d[Math.max(0, aqH.t.indexOf(hour))] ?? null : null), [aqH, hour])
+  const fieldsH = useMemo(() => (windH ? windH.w.map((w) => buildField(w)) : []), [windH])
+  const nowK = nowKey()
+
+  useEffect(() => {
+    windRef.current = wind
+    fieldRef.current = hasWind ? fieldsH[wIdx] ?? null : null
+  }, [wind, hasWind, fieldsH, wIdx])
+  useEffect(() => { aqRef.current = aq }, [aq])
+  /* bila jam tersimpan di luar jangkauan data (mis. lewat tengah malam), lompat ke jam sekarang */
+  useEffect(() => {
+    if (!times.length) return
+    setHour((h) => (times.includes(h) ? h : times[Math.min(times.length - 1, PAST_DAYS * 24 + Number(nowKey().slice(11, 13)))]))
+  }, [times])
+  /* putar otomatis: maju 1 jam tiap detik */
+  useEffect(() => {
+    if (!playing || !times.length) return
+    const id = window.setInterval(() => setHour((h) => times[(Math.max(0, times.indexOf(h)) + 1) % times.length]), 1000)
+    return () => window.clearInterval(id)
+  }, [playing, times])
 
   const windAvg = useMemo(() => {
     if (!wind.length) return null
@@ -472,7 +590,7 @@ export default function App() {
   const applyVis = useCallback((map: MLMap) => {
     const v = visRef.current, l = levelRef.current
     const set = (ids: string[], on: boolean) => ids.forEach((id) => map.getLayer(id) && map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none'))
-    set(['fires-heat'], v.heat); set(['fires-radius', 'fires-glow'], v.radius); set(['fires-pt'], v.points)
+    set(['fires-radius', 'fires-glow'], v.radius); set(['trail-line', 'trail-pt'], v.trail); set(['fires-pt'], v.points)
     set(['prov-fill'], l === 'prov'); set(['kota-fill'], l === 'kota')
     set(['prov-line'], v.borders); set(['kota-line'], v.borders && l === 'kota')
   }, [])
@@ -508,21 +626,9 @@ export default function App() {
     })
     map.addSource('fires', { type: 'geojson', data: firesRef.current })
     map.addSource('radius', { type: 'geojson', data: radiusPoly.current })
+    map.addSource('trail', { type: 'geojson', data: trailRef.current })
     const fireColor = ['step', ['get', 'frp'], '#ffcc80', 5, '#ff8a65', 20, '#ef5350', 50, '#d81b60']
 
-    /* heatmap panas: karmin → oranye → kuning → putih, lebih lembut dan lebar */
-    map.addLayer({
-      id: 'fires-heat', type: 'heatmap', source: 'fires',
-      paint: {
-        'heatmap-weight': ['interpolate', ['linear'], ['to-number', ['get', 'frp'], 0], 0, 0.25, 20, 0.6, 80, 1],
-        'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 3, 0.8, 8, 2],
-        'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 3, 16, 6, 38, 9, 62, 12, 86],
-        'heatmap-color': ['interpolate', ['linear'], ['heatmap-density'],
-          0, 'rgba(120,10,60,0)', 0.15, 'rgba(190,24,93,0.28)', 0.35, 'rgba(239,68,68,0.55)',
-          0.6, 'rgba(251,146,60,0.78)', 0.82, 'rgba(253,224,71,0.9)', 1, 'rgba(255,251,235,0.97)'] as any,
-        'heatmap-opacity': ['interpolate', ['linear'], ['zoom'], 6, 0.95, 10, 0.5, 13, 0.25],
-      },
-    })
     /* radius panas: skala meter nyata, ~0,4 km + 0,25 km x akar(FRP) */
     const meters = ['+', 400, ['*', 250, ['sqrt', ['max', ['to-number', ['get', 'frp'], 0], 0]]]]
     map.addLayer({
@@ -555,6 +661,20 @@ export default function App() {
     })
     map.addLayer({ id: 'radius-fill', type: 'fill', source: 'radius', paint: { 'fill-color': '#4fc3f7', 'fill-opacity': 0.14 } })
     map.addLayer({ id: 'radius-line', type: 'line', source: 'radius', paint: { 'line-color': '#4fc3f7', 'line-width': 2, 'line-dasharray': [2, 2] } })
+    /* jejak asap per jam: garis lintasan + titik tiap jam (label jam dipasang sebagai Marker HTML) */
+    map.addLayer({
+      id: 'trail-line', type: 'line', source: 'trail', filter: ['==', ['geometry-type'], 'LineString'],
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': 'rgba(255,224,190,0.9)', 'line-width': 2, 'line-dasharray': [1.2, 1.6] },
+    })
+    map.addLayer({
+      id: 'trail-pt', type: 'circle', source: 'trail', filter: ['==', ['geometry-type'], 'Point'],
+      paint: {
+        'circle-radius': ['case', ['==', ['get', 'h'], 0], 5, ['==', ['%', ['get', 'h'], 3], 0], 4, 2.2] as any,
+        'circle-color': ['case', ['==', ['get', 'h'], 0], '#ff5d5d', '#fff2e0'] as any,
+        'circle-stroke-color': '#ff8a65', 'circle-stroke-width': 1.2,
+      },
+    })
     applyVis(map)
     applyGeoState(map)
   }, [applyVis, applyGeoState])
@@ -591,8 +711,7 @@ export default function App() {
     const g = geoRef.current[l]
     if (!g) return
     setLvl(l); setMode('area'); setSel({ level: l, idx: i })
-    const b = g.bb[i]
-    mapRef.current?.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 70, duration: 1000, maxZoom: 10 })
+    fitArea(mapRef.current, g, i, l)
   }, [])
 
   /* indikator debug: apakah layer ada & berapa titik tampak di layar */
@@ -636,6 +755,7 @@ export default function App() {
     const hoverId: Record<Level, number> = { prov: -1, kota: -1 }
     const safeEnsure = () => {
       hoverId.prov = -1; hoverId.kota = -1
+      try { map.setProjection({ type: projRef.current } as any) } catch { /* MapLibre < 5: abaikan */ }
       try { ensureLayers(map) } catch (err) { console.error('ensureLayers gagal:', err); lastErr.current = 'ensureLayers: ' + String(err).slice(0, 100) }
     }
     map.on('style.load', safeEnsure)
@@ -689,7 +809,11 @@ export default function App() {
       const l = levelRef.current
       if (modeRef.current === 'area' && geoRef.current[l]) {
         const hit = map.getLayer(`${l}-fill`) ? map.queryRenderedFeatures(e.point, { layers: [`${l}-fill`] })[0] : undefined
-        setSel(hit ? { level: l, idx: Number(hit.properties?._id ?? hit.id) } : null)
+        if (hit) {
+          const idx = Number(hit.properties?._id ?? hit.id)
+          setSel({ level: l, idx })
+          fitArea(map, geoRef.current[l], idx, l) // otomatis zoom ke area yang diklik
+        } else setSel(null)
         return
       }
       center.current = [e.lngLat.lng, e.lngLat.lat]
@@ -776,6 +900,15 @@ export default function App() {
     analyze()
   }, [radiusKm, analyze])
 
+  /* peta datar (Mercator) <-> globe 3D */
+  useEffect(() => {
+    projRef.current = proj
+    const m = mapRef.current
+    if (!m) return
+    const apply = () => { try { m.setProjection({ type: proj } as any) } catch { /* abaikan */ } }
+    if (m.isStyleLoaded()) apply(); else m.once('style.load', apply)
+  }, [proj])
+
   /* ganti basemap: diff:false supaya style.load pasti terpicu lagi */
   useEffect(() => {
     if (lastBasemap.current === basemap) return
@@ -815,29 +948,13 @@ export default function App() {
 
   useEffect(() => { gainRef.current = smokeGain }, [smokeGain])
 
-  /* ambil angin permukaan (grid 2°) dari Open-Meteo, segarkan tiap 30 menit */
+  /* angin per jam (Open-Meteo Forecast), disegarkan tiap 30 menit */
   useEffect(() => {
     let dead = false
     const load = async () => {
       try {
-        try {
-          const c = JSON.parse(localStorage.getItem('fw-wind2') || 'null')
-          if (c && Date.now() - c.t < 20 * 60 * 1000 && c.w.length === NX * NY) {
-            if (!dead) { windRef.current = c.w; setWind(c.w); setWindErr('') }
-            return
-          }
-        } catch { /* abaikan */ }
-        const url = `https://api.open-meteo.com/v1/forecast?${GRID_Q}&current=wind_speed_10m,wind_direction_10m&wind_speed_unit=kmh`
-        const r = await fetch(url)
-        if (!r.ok) throw new Error('HTTP ' + r.status)
-        const j = await r.json()
-        const arr = Array.isArray(j) ? j : [j]
-        if (arr.length !== NX * NY) throw new Error('grid tidak lengkap')
-        const w: WindPt[] = arr.map((d: any, i: number) => ({ lon: GRID_PTS[i].lo, lat: GRID_PTS[i].la, speed: d.current.wind_speed_10m ?? 0, dir: d.current.wind_direction_10m ?? 0 }))
-        if (dead) return
-        windRef.current = w
-        try { localStorage.setItem('fw-wind2', JSON.stringify({ t: Date.now(), w })) } catch { /* abaikan */ }
-        setWind(w); setWindErr('')
+        const w = toWindH(await cached('fw-windh1', fetchWindRaw))
+        if (!dead) { setWindH(w); setWindErr('') }
       } catch { if (!dead) setWindErr('Data angin gagal dimuat') }
     }
     load()
@@ -845,36 +962,13 @@ export default function App() {
     return () => { dead = true; window.clearInterval(t) }
   }, [])
 
-  /* polusi udara CAMS global (PM2.5, PM10, debu, AOD) lewat Open-Meteo Air Quality, segarkan tiap 30 menit */
+  /* polusi udara per jam: CAMS global (PM2.5, PM10, debu, AOD) lewat Open-Meteo Air Quality, disegarkan tiap 30 menit */
   useEffect(() => {
     let dead = false
-    const toAq = (rows: any[]): AqData => {
-      const o: AqData = { pm25: new Float32Array(rows.length), pm10: new Float32Array(rows.length), dust: new Float32Array(rows.length), aod: new Float32Array(rows.length) }
-      rows.forEach((c, i) => { o.pm25[i] = c.pm2_5 ?? 0; o.pm10[i] = c.pm10 ?? 0; o.dust[i] = c.dust ?? 0; o.aod[i] = c.aerosol_optical_depth ?? 0 })
-      return o
-    }
     const load = async () => {
       try {
-        try {
-          const c = JSON.parse(localStorage.getItem('fw-aq2') || 'null')
-          if (c && Date.now() - c.t < 20 * 60 * 1000 && c.rows.length === NX * NY) {
-            const d = toAq(c.rows)
-            if (!dead) { aqRef.current = d; setAq(d); setAqErr('') }
-            return
-          }
-        } catch { /* abaikan */ }
-        const url = `https://air-quality-api.open-meteo.com/v1/air-quality?${GRID_Q}&current=pm2_5,pm10,dust,aerosol_optical_depth&domains=cams_global`
-        const r = await fetch(url)
-        if (!r.ok) throw new Error('HTTP ' + r.status)
-        const j = await r.json()
-        const arr = Array.isArray(j) ? j : [j]
-        if (arr.length !== NX * NY) throw new Error('grid tidak lengkap')
-        const rows = arr.map((d: any) => d.current ?? {})
-        if (dead) return
-        const d = toAq(rows)
-        aqRef.current = d
-        try { localStorage.setItem('fw-aq2', JSON.stringify({ t: Date.now(), rows })) } catch { /* abaikan */ }
-        setAq(d); setAqErr('')
+        const d = toAqH(await cached('fw-aqh1', fetchAqRaw))
+        if (!dead) { setAqH(d); setAqErr('') }
       } catch { if (!dead) setAqErr('Data polusi udara gagal dimuat') }
     }
     load()
@@ -903,6 +997,7 @@ export default function App() {
         for (let x = 0; x < w; x++) {
           const ll = map.unproject([x * CELL + CELL / 2, y * CELL + CELL / 2])
           const lon = ll.lng, lat = ll.lat
+          if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue
           const ex = Math.min(lon - GLON[0], GLON[NX - 1] - lon), ey = Math.min(lat - GLAT[0], GLAT[NY - 1] - lat)
           if (ex < 0 || ey < 0) continue
           const edge = Math.min(1, Math.min(ex, ey) / 3)
@@ -928,8 +1023,7 @@ export default function App() {
     if (!map || !cv) return
     const ctx = cv.getContext('2d')!
     const clear = () => { ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, cv.width, cv.height); ctx.restore() }
-    if (!vis.wind || wind.length !== NX * NY) { clear(); return }
-    const field = buildField(wind)
+    if (!vis.wind || !hasWind) { clear(); return }
     const dpr = window.devicePixelRatio || 1
     type P = { lon: number; lat: number; age: number; max: number; px: number; py: number }
     let W = 0, H = 0, ps: P[] = []
@@ -959,6 +1053,8 @@ export default function App() {
     let raf = 0, last = performance.now(), clock = 0
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame)
+      const field = fieldRef.current // angin jam terpilih (berganti tanpa mengulang partikel)
+      if (!field) return
       const dt = Math.min((now - last) / 16.67, 3)
       last = now; clock += dt
       ctx.globalCompositeOperation = 'destination-out'
@@ -1006,7 +1102,7 @@ export default function App() {
     }
     raf = requestAnimationFrame(frame)
     return () => { cancelAnimationFrame(raf); map.off('move', onMove); map.off('resize', setup); clear() }
-  }, [wind, vis.wind])
+  }, [hasWind, vis.wind])
 
   /* sebaran asap & debu: partikel keluar dari titik panas (lebih banyak di FRP besar), terbawa angin,
      melebar karena turbulensi. Semua partikel dijumlahkan menjadi peta kerapatan beresolusi rendah lalu
@@ -1017,8 +1113,7 @@ export default function App() {
     const ctx = cv.getContext('2d')!
     const clear = () => { ctx.clearRect(0, 0, cv.width, cv.height) }
     const fires = filtered.features
-    if (!vis.smoke || wind.length !== NX * NY || !fires.length) { clear(); return }
-    const field = buildField(wind)
+    if (!vis.smoke || !hasWind || !fires.length) { clear(); return }
     const cum = new Float64Array(fires.length)
     let tot = 0
     fires.forEach((f, i) => { tot += Math.sqrt(Math.max(Number(f.properties.frp) || 1, 1)); cum[i] = tot })
@@ -1057,7 +1152,8 @@ export default function App() {
     let raf = 0, last = performance.now(), clock = 0
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame)
-      if (!img) return
+      const field = fieldRef.current // asap mengikuti angin jam terpilih
+      if (!img || !field) return
       const dt = Math.min((now - last) / 16.67, 3)
       last = now; clock += dt
       const z = map.getZoom()
@@ -1106,7 +1202,7 @@ export default function App() {
     }
     raf = requestAnimationFrame(frame)
     return () => { cancelAnimationFrame(raf); map.off('resize', setup); clear() }
-  }, [wind, vis.smoke, filtered])
+  }, [hasWind, vis.smoke, filtered])
 
   const smoke = useMemo(() => {
     if (wind.length !== NX * NY || !filtered.features.length) return null
@@ -1161,6 +1257,91 @@ export default function App() {
     }
   }, [sel, geo, stats, aq, wind, filtered])
 
+  /* titik api sumber untuk jejak & ringkasan per jam: wilayah terpilih, atau seluruh Indonesia */
+  const srcFires = useMemo(() => {
+    if (!sel) return filtered.features
+    const key = sel.level === 'prov' ? '_pi' : '_ki'
+    return filtered.features.filter((f) => f.properties[key] === sel.idx)
+  }, [filtered, sel])
+
+  const trailSeeds = useMemo(() => {
+    const top = [...srcFires].sort((a, b) => (Number(b.properties.frp) || 0) - (Number(a.properties.frp) || 0))
+    const sep = sel ? 0.2 : 1.5, max = sel ? 3 : 4
+    const out: [number, number][] = []
+    for (const f of top) {
+      const [lo, la] = f.geometry.coordinates
+      if (out.every((q) => Math.hypot(q[0] - lo, q[1] - la) >= sep)) out.push([lo, la])
+      if (out.length >= max) break
+    }
+    return out
+  }, [srcFires, sel])
+
+  /* jejak asap: parcel dari titik api terbesar digeser angin JAM DEMI JAM (maks. 24 jam ke depan dari jam terpilih) */
+  const trails = useMemo(() => {
+    const labels: { lon: number; lat: number; text: string }[] = []
+    if (!windH || wIdx < 0 || !fieldsH.length) return { fc: EMPTY_FC, labels }
+    const lines: Feature[] = [], pts: Feature[] = []
+    const horizon = Math.min(24, windH.t.length - 1 - wIdx)
+    const tmp = [0, 0]
+    trailSeeds.forEach((sd, n) => {
+      let lon = sd[0], lat = sd[1]
+      const line: number[][] = [[lon, lat]]
+      pts.push({ type: 'Feature', properties: { h: 0, n }, geometry: { type: 'Point', coordinates: [lon, lat] } })
+      for (let h = 1; h <= horizon; h++) {
+        sampleWind(fieldsH[wIdx + h - 1], lon, lat, tmp)
+        const cl = Math.max(0.2, Math.cos((lat * Math.PI) / 180))
+        lon += tmp[0] / (111.32 * cl) // km/j × 1 jam → derajat
+        lat += tmp[1] / 110.57
+        line.push([lon, lat])
+        pts.push({ type: 'Feature', properties: { h, n }, geometry: { type: 'Point', coordinates: [lon, lat] } })
+        if (n === 0 && h % 6 === 0) labels.push({ lon, lat, text: `+${h}j ${hh(windH.t[wIdx + h])}` })
+      }
+      lines.push({ type: 'Feature', properties: { n }, geometry: { type: 'LineString', coordinates: line } })
+    })
+    return { fc: { type: 'FeatureCollection', features: [...lines, ...pts] } as FeatureCollection, labels }
+  }, [windH, wIdx, fieldsH, trailSeeds])
+
+  useEffect(() => {
+    trailRef.current = trails.fc
+    ;(mapRef.current?.getSource('trail') as GeoJSONSource | undefined)?.setData(trails.fc)
+  }, [trails])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !vis.trail) return
+    const ms = trails.labels.map((l) => {
+      const e = document.createElement('div')
+      e.className = 'trail-lbl'
+      e.textContent = l.text
+      return new Marker({ element: e, anchor: 'left', offset: [8, 0] }).setLngLat([l.lon, l.lat]).addTo(map)
+    })
+    return () => ms.forEach((m) => m.remove())
+  }, [trails, vis.trail])
+
+  /* ringkasan tiap jam: PM2.5 rata-rata di titik api + angin pembawa asap (dibobot FRP) */
+  const hourly = useMemo(() => {
+    if (!windH || !aqH || !srcFires.length) return null
+    const step = Math.max(1, Math.floor(srcFires.length / 300))
+    const S: [number, number, number][] = []
+    for (let i = 0; i < srcFires.length; i += step) {
+      const f = srcFires[i]
+      const [lon, lat] = f.geometry.coordinates
+      S.push([lon, lat, Math.sqrt(Math.max(Number(f.properties.frp) || 1, 1))])
+    }
+    const t = [0, 0]
+    return windH.t.map((k, h) => {
+      const ai = aqH.t.indexOf(k)
+      let pm = 0, x = 0, y = 0, ws = 0
+      for (const [lon, lat, w] of S) {
+        if (ai >= 0) pm += sampleGrid(aqH.d[ai].pm25, lon, lat)
+        sampleWind(fieldsH[h], lon, lat, t)
+        x += t[0] * w; y += t[1] * w; ws += w
+      }
+      return { k, pm: ai >= 0 ? pm / S.length : null, speed: Math.round(Math.hypot(x, y) / ws), dir: ((Math.atan2(x, y) * 180) / Math.PI + 360) % 360 }
+    })
+  }, [windH, aqH, fieldsH, srcFires])
+  const hMax = hourly ? Math.max(10, ...hourly.map((r) => r.pm ?? 0)) : 10
+
   const rangeLabel = useMemo(() => {
     const e = new Date(), st = new Date()
     st.setDate(e.getDate() - (days - 1))
@@ -1202,23 +1383,22 @@ export default function App() {
     <div className="app">
       <header className="top">
         <div className="brand">
-          <div className="logo">🔥</div>
-          <div>
-            <h1>FIREWATCH <span>INDONESIA</span></h1>
-            <p>Titik panas satelit • asap • polusi udara • angin</p>
-          </div>
+          <svg className="logo" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5c.4 3.6 4.9 5.5 4.9 10.3a4.9 4.9 0 0 1-9.8 0c0-2 .9-3.3 1.7-4.4.2 1.2.8 2 1.6 2.4C10.3 7.6 11.5 5.3 12 2.5Z" /></svg>
+          <h1>Firewatch</h1>
         </div>
-        <div className="top-status">
-          <span className={`dot ${loading ? 'busy' : error ? 'bad' : 'ok'}`} />
-          {loading ? 'Memuat data…' : error ? 'Gagal memuat data' : `Diperbarui ${updatedAt}`}
+        <nav className="crumb" aria-label="Wilayah terpilih">
+          <button className="crumb-in" onClick={() => setSel(null)}>Indonesia</button>
+          {detail && detail.parent && <><em>/</em><span>{detail.parent}</span></>}
+          {detail && <><em>/</em><span className="cur">{detail.name}</span></>}
+        </nav>
+        <div className="top-meta">
+          <span>{nf.format(indo.features.length)} dari {nf.format(raw.features.length)} titik berada di Indonesia</span>
+          <span className="top-status">
+            <span className={`dot ${loading ? 'busy' : error ? 'bad' : 'ok'}`} />
+            {loading ? 'Memuat data…' : error ? 'Gagal memuat data' : `Diperbarui ${updatedAt}`}
+          </span>
         </div>
       </header>
-      <div className="crumb">
-        <span className="crumb-in" onClick={() => setSel(null)}>Indonesia</span>
-        {detail && detail.parent && <><em>›</em><span>{detail.parent}</span></>}
-        {detail && <><em>›</em><span className="cur">{detail.name}</span></>}
-        <small>Mentah {nf.format(raw.features.length)} → Indonesia {nf.format(indo.features.length)}</small>
-      </div>
 
       <div className="body">
         <main className="mapwrap">
@@ -1227,51 +1407,69 @@ export default function App() {
           <canvas ref={smokeRef} className="smokecv" />
           <canvas ref={cvsRef} className="windcv" />
 
-          <div className="toolbar">
-            <select className="pill" value={basemap} onChange={(e) => setBasemap(e.target.value)} title="Basemap">
+          <div className="toolbar" role="toolbar" aria-label="Kontrol peta">
+            <select className="sel w-bm" value={basemap} onChange={(e) => setBasemap(e.target.value)} title="Basemap">
               {Object.keys(BASEMAPS).map((k) => <option key={k}>{k}</option>)}
             </select>
-            <select className="pill" value={source} onChange={(e) => setSource(e.target.value)} title="Sensor satelit">
+            <select className="sel w-sn" value={source} onChange={(e) => setSource(e.target.value)} title="Sensor satelit">
               <option value="VIIRS_SNPP_NRT">VIIRS S-NPP (375 m)</option>
               <option value="VIIRS_NOAA20_NRT">VIIRS NOAA-20 (375 m)</option>
               <option value="VIIRS_NOAA21_NRT">VIIRS NOAA-21 (375 m)</option>
               <option value="MODIS_NRT">MODIS (1 km)</option>
             </select>
-            {vis.aq && (
-              <select className="pill" value={aqVar} onChange={(e) => setAqVar(e.target.value as AqKey)} title="Variabel polusi udara">
-                {(Object.keys(AQ_DEF) as AqKey[]).map((k) => <option key={k} value={k}>{AQ_DEF[k].label}</option>)}
-              </select>
-            )}
-            <div className="seg pillseg" title="Tingkat keyakinan">
-              {['Semua', 'Sedang+', 'Tinggi'].map((t, i) => (
-                <button key={t} className={minLevel === i ? 'on' : ''} onClick={() => setMinLevel(i)}>{t}</button>
-              ))}
+            <span className="tb-sep" />
+            <div className="tb-grp">
+              <span className="tb-lbl">Keyakinan</span>
+              <div className="seg" title="Tingkat keyakinan deteksi">
+                {['Semua', 'Sedang+', 'Tinggi'].map((t, i) => (
+                  <button key={t} className={minLevel === i ? 'on' : ''} onClick={() => setMinLevel(i)}>{t}</button>
+                ))}
+              </div>
             </div>
             {hasGeo && (
-              <div className="seg pillseg" title="Tingkat wilayah yang bisa diklik">
-                <button className={lvl === 'prov' ? 'on' : ''} disabled={!geo.prov} onClick={() => setLvl('prov')}>Provinsi</button>
-                <button className={lvl === 'kota' ? 'on' : ''} disabled={!geo.kota} onClick={() => setLvl('kota')}>Kota/Kab</button>
+              <div className="tb-grp">
+                <span className="tb-lbl">Wilayah</span>
+                <div className="seg" title="Tingkat wilayah yang bisa diklik">
+                  <button className={lvl === 'prov' ? 'on' : ''} disabled={!geo.prov} onClick={() => setLvl('prov')}>Provinsi</button>
+                  <button className={lvl === 'kota' ? 'on' : ''} disabled={!geo.kota} onClick={() => setLvl('kota')}>Kota/Kab</button>
+                </div>
               </div>
             )}
+            <div className="tb-grp">
+              <span className="tb-lbl">Peta</span>
+              <div className="seg" title="Bentuk peta">
+                <button className={proj === 'mercator' ? 'on' : ''} onClick={() => setProj('mercator')}>Datar</button>
+                <button className={proj === 'globe' ? 'on' : ''} onClick={() => setProj('globe')}>Globe</button>
+              </div>
+            </div>
+          </div>
+
+          <div className="map-actions">
+            <button onClick={() => focus(INDONESIA)}>Fokus Indonesia</button>
+            <button onClick={flyToBiggest}>Api terbesar</button>
           </div>
 
           <div className="leftbar">
-            <div className="quick">
-              <button className="chip on2" onClick={() => focus(INDONESIA)}>🇮🇩 Fokus Indonesia</button>
-              <button className="chip on2" onClick={flyToBiggest}>📍 Api terbesar</button>
-            </div>
             <div className="panel layers">
-              <div className="panel-h">Lapisan</div>
-              {LAYER_LIST.map(([k, t]) => (
-                <button key={k} className={vis[k] ? 'sw on' : 'sw'} onClick={() => setVis((v) => ({ ...v, [k]: !v[k] }))}>
-                  <i /><span>{t}</span>
-                </button>
-              ))}
-              {vis.smoke && (
-                <div className="slider-row">
-                  <small>Intensitas asap</small>
-                  <input type="range" min={0.4} max={2.5} step={0.1} value={smokeGain} onChange={(e) => setSmokeGain(+e.target.value)} />
-                </div>
+              <button className="panel-h tog" onClick={() => setLayersOpen((o) => !o)} aria-expanded={layersOpen} title={layersOpen ? 'Tutup panel lapisan' : 'Buka panel lapisan'}>
+                <span>Lapisan</span>
+                <em>{LAYER_LIST.filter(([k]) => vis[k]).length}/{LAYER_LIST.length}</em>
+                <i className={layersOpen ? 'open' : ''} />
+              </button>
+              {layersOpen && (
+                <>
+                  {LAYER_LIST.map(([k, t]) => (
+                    <button key={k} className={vis[k] ? 'sw on' : 'sw'} onClick={() => setVis((v) => ({ ...v, [k]: !v[k] }))} aria-pressed={vis[k]}>
+                      <i /><span>{t}</span>
+                    </button>
+                  ))}
+                  {vis.smoke && (
+                    <div className="slider-row">
+                      <small>Intensitas asap</small>
+                      <input type="range" min={0.4} max={2.5} step={0.1} value={smokeGain} onChange={(e) => setSmokeGain(+e.target.value)} aria-label="Intensitas asap" />
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -1280,12 +1478,14 @@ export default function App() {
           {loading && <div className="loading">Memuat titik panas…</div>}
           {geoState === 'none' && <div className="toast toast2">GeoJSON wilayah tidak ditemukan di {GEO_URL.prov} / {GEO_URL.kota}. Sementara memakai batas pulau perkiraan.</div>}
           {hoverName && mode === 'area' && <div className="hovertag">{hoverName}</div>}
-          {windAvg && vis.wind && (
-            <div className="mapchip"><span className="wind-dial sm"><i style={{ transform: `rotate(${windAvg.dir}deg)` }}>↑</i></span>Angin {windAvg.speed} km/j → {compass(windAvg.dir)}</div>
-          )}
           {vis.aq && (
             <div className="aqlegend">
-              <div className="aql-h"><b>{aqDef.label}</b><span>{aqDef.unit || 'dimensionless'}</span></div>
+              <div className="aql-h">
+                <select className="sel sm" value={aqVar} onChange={(e) => setAqVar(e.target.value as AqKey)} title="Variabel polusi udara" aria-label="Variabel polusi udara">
+                  {(Object.keys(AQ_DEF) as AqKey[]).map((k) => <option key={k} value={k}>{AQ_DEF[k].label}</option>)}
+                </select>
+                <span>{aqDef.unit || 'tanpa satuan'}</span>
+              </div>
               <div className="aql-bar" style={{ background: AQ_LEGEND }} />
               <div className="aql-t">
                 {[0, 2, 4, 6].map((i) => <span key={i}>{aqDef.stops[i] >= 100 ? Math.round(aqDef.stops[i]) : aqDef.stops[i]}{i === 6 ? '+' : ''}</span>)}
@@ -1293,11 +1493,31 @@ export default function App() {
             </div>
           )}
 
-          <div className="timeline">
-            <div className="tl-left"><small>Rentang waktu</small><b>{rangeLabel}</b></div>
-            <div className="tl-slider">
-              <input type="range" min={1} max={5} value={days} onChange={(e) => setDays(+e.target.value)} />
-              <div className="tl-ticks">{[1, 2, 3, 4, 5].map((d) => <span key={d} className={d <= days ? 'on' : ''}>{d}h</span>)}</div>
+          <div className="dock">
+            <button className="dk-play" disabled={!times.length} onClick={() => setPlaying((v) => !v)} title={playing ? 'Jeda' : 'Putar per jam'} aria-label={playing ? 'Jeda' : 'Putar per jam'}>
+              {playing
+                ? <svg viewBox="0 0 12 12"><rect x="1.5" y="1" width="3" height="10" /><rect x="7.5" y="1" width="3" height="10" /></svg>
+                : <svg viewBox="0 0 12 12"><path d="M2 1l9 5-9 5z" /></svg>}
+            </button>
+            <div className="dk-main">
+              {times.length ? (
+                <>
+                  <div className="dk-top">
+                    <b>{dayLabel(hour)}, {hh(hour)} WIB</b>
+                    <span className={`dk-tag${hour > nowK ? ' fc' : hour === nowK ? ' now' : ''}`}>{hour > nowK ? 'Prakiraan' : hour === nowK ? 'Sekarang' : 'Riwayat'}</span>
+                    {windAvg && vis.wind && (
+                      <span className="dk-wind" title="Rata-rata angin 10 m seluruh grid pada jam ini"><i style={{ transform: `rotate(${windAvg.dir}deg)` }}>↑</i>Angin {windAvg.speed} km/j ke {compass(windAvg.dir)}</span>
+                    )}
+                    <button className="dk-now" style={windAvg && vis.wind ? undefined : { marginLeft: 'auto' }} onClick={() => { setPlaying(false); setHour(times.includes(nowK) ? nowK : times[hi]) }}>Sekarang</button>
+                  </div>
+                  <input type="range" min={0} max={times.length - 1} value={hi} onChange={(e) => { setPlaying(false); setHour(times[+e.target.value]) }} aria-label="Jam" />
+                  <div className="dk-ticks">
+                    {times.map((k, i) => i % 6 === 0 ? (
+                      <span key={k} style={{ left: `${(i / (times.length - 1)) * 100}%` }}>{k.slice(11, 13) === '00' ? `${k.slice(8, 10)}/${k.slice(5, 7)}` : k.slice(11, 13)}</span>
+                    ) : null)}
+                  </div>
+                </>
+              ) : <div className="hint">{windErr || aqErr || 'Memuat data angin dan polusi per jam…'}</div>}
             </div>
           </div>
           {showDbg && <div className="dbg">{dbg}</div>}
@@ -1362,6 +1582,12 @@ export default function App() {
           <section className="card">
             <div className="card-h">Titik panas</div>
             <p className="card-d">Jumlah deteksi satelit di wilayah Indonesia pada rentang waktu terpilih, dipisah per tingkat keyakinan.</p>
+            <div className="range-row">
+              <div className="seg" role="group" aria-label="Rentang titik panas (hari)">
+                {[1, 2, 3, 4, 5].map((d) => <button key={d} className={days === d ? 'on' : ''} onClick={() => setDays(d)}>{d}</button>)}
+              </div>
+              <span>hari terakhir ({rangeLabel})</span>
+            </div>
             <div className="donut">
               <svg viewBox="0 0 160 160"><g transform="rotate(-90 80 80)"><circle r="62" cx="80" cy="80" fill="none" stroke="#23272f" strokeWidth="14" />{ring}</g></svg>
               <div className="donut-c"><b>{nf.format(stats.total)}</b><small>titik</small></div>
@@ -1379,7 +1605,7 @@ export default function App() {
 
           <section className="card">
             <div className="card-h">Polusi udara & asap</div>
-            <p className="card-d">Medan PM2.5 / PM10 / debu / AOD dari model CAMS (resolusi ±45 km). Kepulan peach → ungu = simulasi sebaran asap dari titik panas yang terbawa angin.</p>
+            <p className="card-d">Medan PM2.5 / PM10 / debu / AOD dari model CAMS (±45 km) untuk {dayLabel(hour)} pukul {hh(hour)} WIB; geser jam di bawah peta untuk melihat pergeserannya. Kepulan peach → ungu = simulasi sebaran asap dari titik panas yang terbawa angin jam itu.</p>
             {aqStats ? (
               <div className="duo">
                 <div>
@@ -1403,12 +1629,52 @@ export default function App() {
           </section>
 
           <section className="card">
+            <div className="card-h">Pergerakan per jam</div>
+            <p className="card-d">
+              Tiap batang = PM2.5 rata-rata di titik api {sel ? 'wilayah terpilih' : 'seluruh Indonesia'} pada satu jam (kemarin → besok, WIB). Klik batang untuk melompat ke jam itu.
+              Garis putus-putus di peta = jejak asap per jam dari api terbesar, dibawa angin tiap jam.
+            </p>
+            {hourly ? (
+              <>
+                <div className="hbars">
+                  {hourly.map((r, i) => (
+                    <button
+                      key={r.k}
+                      className={`${i === hi ? 'on' : ''}${r.k === nowK ? ' now' : ''}`}
+                      style={{ height: `${6 + ((r.pm ?? 0) / hMax) * 54}px`, background: r.pm != null ? pmBand(r.pm).c : '#3a3f4b' }}
+                      title={`${dayLabel(r.k)} ${hh(r.k)} • PM2.5 ${r.pm != null ? Math.round(r.pm) : '-'} µg/m³ • angin ${r.speed} km/j → ${compass(r.dir)}`}
+                      onClick={() => { setPlaying(false); setHour(r.k) }}
+                    />
+                  ))}
+                </div>
+                <div className="hbars-ax"><span>{dayLabel(hourly[0].k)}</span><span>garis putih = jam ini</span><span>{dayLabel(hourly[hourly.length - 1].k)}</span></div>
+                <div className="hlist">
+                  {hourly.slice(hi, hi + 13).filter((_, n) => n % 3 === 0).map((r, n) => (
+                    <div key={r.k} className={`hrow${n === 0 ? ' cur' : ''}`} onClick={() => { setPlaying(false); setHour(r.k) }}>
+                      <span className="hr-t">{n === 0 ? 'Jam ini' : `+${n * 3} jam`}<small>{hh(r.k)}</small></span>
+                      <span className="wind-dial sm"><i style={{ transform: `rotate(${r.dir}deg)` }}>↑</i></span>
+                      <span className="hr-w"><b>{r.speed} km/j</b><small>asap menuju {compass(r.dir)}</small></span>
+                      <span className="hr-p" style={{ color: r.pm != null ? pmBand(r.pm).c : undefined }}>{r.pm != null ? nf.format(Math.round(r.pm)) : '-'}<small>PM2.5</small></span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : <div className="hint">{windErr || aqErr || (srcFires.length ? 'Memuat data per jam…' : 'Tidak ada titik panas pada pilihan ini.')}</div>}
+            <p className="note">
+              Sumber: angin = Open-Meteo Forecast API (model cuaca global, 10 m); polusi = Open-Meteo Air Quality API dari model CAMS Global (Copernicus/ECMWF, ±45 km); titik api = NASA FIRMS. Jam setelah sekarang adalah prakiraan model, bukan pengukuran.
+            </p>
+          </section>
+
+          <section className="card">
             <div className="card-h">Angin permukaan</div>
-            <p className="card-d">Garis berwarna = aliran angin (biru lambat → merah kencang). Titik terang di ujung garis menunjukkan arah.</p>
+            <p className="card-d">
+              Garis berwarna = aliran angin (biru lambat → merah kencang); titik terang di ujung garis menunjukkan arah. Panah = arah TUJUAN angin
+              (Open-Meteo memberi arah ASAL, sudah dibalik 180°). Angin permukaan 10 m pada grid 2° (±220 km): menggambarkan pola regional, bukan angin lokal.
+            </p>
             {windAvg ? (
               <div className="wind-card">
                 <span className="wind-dial"><i style={{ transform: `rotate(${windAvg.dir}deg)` }}>↑</i></span>
-                <div><b>{windAvg.speed} km/j</b> menuju {compass(windAvg.dir)}<small>Rata-rata {wind.length} titik grid • Open-Meteo</small></div>
+                <div><b>{windAvg.speed} km/j</b> menuju {compass(windAvg.dir)}<small>Rata-rata {wind.length} titik grid • {hh(hour)} WIB • Open-Meteo</small></div>
               </div>
             ) : <div className="hint">{windErr || 'Memuat data angin…'}</div>}
             <div className="wind-scale"><i /><div><span>lambat</span><span>sedang</span><span>kencang</span></div></div>
@@ -1471,8 +1737,7 @@ export default function App() {
 
           <section className="card">
             <div className="card-h">Legenda</div>
-            <div className="heat-bar" />
-            <div className="heat-lbl"><span>Kepadatan rendah</span><span>tinggi</span></div>
+            <p className="card-d">Warna titik menurut FRP (energi api):</p>
             <div className="legend">
               <span><i style={{ background: '#ffcc80' }} />&lt; 5</span>
               <span><i style={{ background: '#ff8a65' }} />5–20</span>
@@ -1483,7 +1748,7 @@ export default function App() {
               FRP (Fire Radiative Power) = besar energi api. Titik panas bukan selalu kebakaran, melainkan anomali panas yang
               terdeteksi satelit. Lingkaran tipis = radius panas (±0,4 km + 0,25 km × √FRP). Plume asap adalah simulasi visual
               dari titik panas dan angin, bukan pengukuran; bukan pengganti peringatan resmi atau stasiun pemantau lokal.
-              Waktu dalam WIB. Sumber: NASA FIRMS • Angin & polusi udara: Open-Meteo (data CAMS, Copernicus) • Basemap: Carto / Esri / OpenFreeMap.
+              Waktu dalam WIB. Sumber: NASA FIRMS • Angin: Open-Meteo Forecast (per jam) • Polusi udara: Open-Meteo Air Quality, data CAMS Copernicus (per jam) • Basemap: Carto / Esri / OpenFreeMap.
             </p>
           </section>
         </aside>
