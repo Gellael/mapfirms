@@ -1384,7 +1384,7 @@ export default function App() {
       <header className="top">
         <div className="brand">
           <svg className="logo" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5c.4 3.6 4.9 5.5 4.9 10.3a4.9 4.9 0 0 1-9.8 0c0-2 .9-3.3 1.7-4.4.2 1.2.8 2 1.6 2.4C10.3 7.6 11.5 5.3 12 2.5Z" /></svg>
-          <h1>Firewatch</h1>
+          <h1>BaraNusa</h1>
         </div>
         <nav className="crumb" aria-label="Wilayah terpilih">
           <button className="crumb-in" onClick={() => setSel(null)}>Indonesia</button>
