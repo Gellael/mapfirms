@@ -169,6 +169,13 @@ function level(c: unknown): 0 | 1 | 2 {
 }
 const LEVEL_NAME = ['Rendah', 'Sedang', 'Tinggi']
 const nf = new Intl.NumberFormat('id-ID')
+/* tata letak HP/tablet: panel statistik menjadi bottom sheet di atas peta (lihat styles.css) */
+const isNarrow = () => window.innerWidth <= 900
+/* padding fitBounds di layar sempit: sisakan ruang bawah untuk bottom sheet */
+function narrowPad(h: number, frac: number) {
+  const bottom = Math.max(0, Math.min(Math.round(h * frac), h - 150))
+  return { top: 70, bottom, left: 24, right: 24 }
+}
 
 /* ------------------- Grid angin & polusi udara (Open-Meteo / CAMS) ------------- */
 type WindPt = { lon: number; lat: number; speed: number; dir: number } // dir = arah ASAL angin (derajat)
@@ -383,7 +390,7 @@ function fitArea(map: MLMap | null, g: Geo | null, i: number, l: Level) {
   const c = map.getContainer()
   const wide = c.clientWidth > 760 && c.clientHeight > 520
   map.fitBounds([[b[0], b[1]], [b[2], b[3]]], {
-    padding: wide ? { top: 70, bottom: 130, left: 250, right: 70 } : 40,
+    padding: isNarrow() ? narrowPad(c.clientHeight, 0.5) : wide ? { top: 70, bottom: 130, left: 250, right: 70 } : 40,
     duration: 1000, maxZoom: l === 'kota' ? 11 : 9, essential: true,
   })
 }
@@ -462,6 +469,8 @@ export default function App() {
   const [mode, setMode] = useState<'area' | 'radius'>('area')
   const [sel, setSel] = useState<{ level: Level; idx: number } | null>(null)
   const [hoverName, setHoverName] = useState('')
+  const [sheet, setSheet] = useState<'peek' | 'half' | 'full'>('peek') // hanya dipakai di layar sempit
+  const swipeY = useRef<number | null>(null)
   const cvsRef = useRef<HTMLCanvasElement>(null)
   const smokeRef = useRef<HTMLCanvasElement>(null)
   const aqCvRef = useRef<HTMLCanvasElement>(null)
@@ -706,7 +715,11 @@ export default function App() {
   }, [])
 
   const focus = useCallback((b: [number, number, number, number]) => {
-    mapRef.current?.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 40, duration: 1200, maxZoom: 9 })
+    const m = mapRef.current
+    if (!m) return
+    m.fitBounds([[b[0], b[1]], [b[2], b[3]]], {
+      padding: isNarrow() ? narrowPad(m.getContainer().clientHeight, 0.25) : 40, duration: 1200, maxZoom: 9,
+    })
   }, [])
 
   /* pilih wilayah (dari daftar/detail) + zoom ke batasnya */
@@ -714,6 +727,7 @@ export default function App() {
     const g = geoRef.current[l]
     if (!g) return
     setLvl(l); setMode('area'); setSel({ level: l, idx: i })
+    if (isNarrow()) setSheet('half')
     fitArea(mapRef.current, g, i, l)
   }, [])
 
@@ -745,7 +759,7 @@ export default function App() {
       style: BASEMAPS[DEFAULT_BASEMAP],
       center: [118, -2],
       zoom: 3.6,
-      attributionControl: { compact: false },
+      attributionControl: { compact: isNarrow() },
       // tambahkan ?key=... ke semua permintaan tile/style/glyph/sprite milik CARTO
       transformRequest: (url: string) =>
         CARTO_KEY && url.includes('basemaps.cartocdn.com') && !/[?&]key=/.test(url)
@@ -883,6 +897,11 @@ export default function App() {
       if (sel && m.getSource(sel.level)) m.setFeatureState({ source: sel.level, id: sel.idx }, { sel: true })
     }
     prevSel.current = sel
+  }, [sel])
+
+  /* di HP: memilih wilayah otomatis membuka bottom sheet agar detailnya terlihat */
+  useEffect(() => {
+    if (sel && isNarrow()) setSheet((s) => (s === 'peek' ? 'half' : s))
   }, [sel])
 
   useEffect(() => {
@@ -1137,7 +1156,7 @@ export default function App() {
     let dens = new Float32Array(1)
     let img: ImageData | null = null
     let u32 = new Uint32Array(1)
-    const ps: S[] = Array.from({ length: Math.min(9000, Math.max(2000, fires.length * 3)) }, () => {
+    const ps: S[] = Array.from({ length: Math.min(isNarrow() ? 3500 : 9000, Math.max(isNarrow() ? 1200 : 2000, fires.length * 3)) }, () => {
       const p = { lon: 0, lat: 0, age: 0, life: 0 }; spawn(p); p.age = Math.random() * p.life; return p
     })
     const setup = () => {
@@ -1378,6 +1397,9 @@ export default function App() {
     analyze()
   }
 
+  const stepSheet = (dir: 1 | -1) =>
+    setSheet((s) => { const o = ['peek', 'half', 'full'] as const; return o[Math.min(2, Math.max(0, o.indexOf(s) + dir))] })
+
   const aqDef = AQ_DEF[aqVar]
   const hasGeo = !!(geo.prov || geo.kota)
   const avgBand = aqStats?.avg != null ? pmBand(aqStats.avg) : null
@@ -1398,7 +1420,7 @@ export default function App() {
           <span>{nf.format(indo.features.length)} dari {nf.format(raw.features.length)} titik berada di Indonesia</span>
           <span className="top-status">
             <span className={`dot ${loading ? 'busy' : error ? 'bad' : 'ok'}`} />
-            {loading ? 'Memuat data…' : error ? 'Gagal memuat data' : `Diperbarui ${updatedAt}`}
+            <span className="st-txt">{loading ? 'Memuat data…' : error ? 'Gagal memuat data' : `Diperbarui ${updatedAt}`}</span>
           </span>
         </div>
       </header>
@@ -1526,7 +1548,27 @@ export default function App() {
           {showDbg && <div className="dbg">{dbg}</div>}
         </main>
 
-        <aside className="stats">
+        <aside className={`stats sheet-${sheet}`}>
+          <button
+            className="sheet-handle"
+            aria-expanded={sheet !== 'peek'}
+            aria-label={sheet === 'peek' ? 'Buka panel statistik' : 'Tutup panel statistik'}
+            onClick={() => setSheet((s) => (s === 'peek' ? 'half' : s === 'half' ? 'full' : 'peek'))}
+            onTouchStart={(e) => { swipeY.current = e.touches[0].clientY }}
+            onTouchEnd={(e) => {
+              const y0 = swipeY.current
+              swipeY.current = null
+              if (y0 == null) return
+              const dy = e.changedTouches[0].clientY - y0
+              if (Math.abs(dy) > 36) { stepSheet(dy < 0 ? 1 : -1); e.preventDefault() }
+            }}
+          >
+            <span className="sh-t">
+              <b>{nf.format(stats.total)} titik panas</b>
+              <small>{detail ? detail.name : sheet === 'peek' ? 'Geser ke atas untuk statistik' : 'Geser ke bawah untuk menutup'}</small>
+            </span>
+            <i className={sheet === 'peek' ? 'chev up' : 'chev'} />
+          </button>
           <h2 className="st-title">Statistik</h2>
           {error && <div className="err">{error}</div>}
 
