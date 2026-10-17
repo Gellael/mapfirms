@@ -5,8 +5,9 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 import * as turf from '@turf/turf'
 import type { Feature, FeatureCollection, Point } from 'geojson'
 
-// Worker MapLibre disajikan Vite sebagai file terpisah (perbaikan "Worker failed to load")
-import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
+// Worker MapLibre disajikan Vite sebagai file terpisah (perbaikan "Worker failed to load").
+// maplibre-gl v5 tidak punya maplibre-gl-worker.mjs; file yang ada adalah versi CSP.
+import workerUrl from 'maplibre-gl/dist/maplibre-gl-csp-worker.js?url'
 setWorkerUrl(workerUrl)
 
 /* ---------------------------------- Basemap --------------------------------- */
@@ -19,6 +20,10 @@ const CARTO_ATTR = '© OpenStreetMap contributors © CARTO'
 /* API key CARTO Basemaps: isi VITE_CARTO_KEY di frontend/.env (lihat transformRequest di bawah) */
 const CARTO_KEY = (import.meta.env.VITE_CARTO_KEY as string | undefined)?.trim()
 const sub = (style: string) => [`https://basemaps.cartocdn.com/rastertiles/${style}/{z}/{x}/{y}.png`]
+
+/* URL backend Rust untuk produksi, mis. https://api-kamu.example.com (tanpa garis miring akhir).
+   Kosongkan saat dev lokal: permintaan /api diteruskan oleh proxy Vite. */
+const API_BASE = ((import.meta.env.VITE_API_URL as string | undefined) ?? '').trim().replace(/\/+$/, '')
 
 const DEFAULT_BASEMAP = 'Gelap (Carto)'
 const ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas'
@@ -165,7 +170,6 @@ function level(c: unknown): 0 | 1 | 2 {
 }
 const LEVEL_NAME = ['Rendah', 'Sedang', 'Tinggi']
 const nf = new Intl.NumberFormat('id-ID')
-const nf1 = new Intl.NumberFormat('id-ID', { maximumFractionDigits: 1 })
 
 /* ------------------- Grid angin & polusi udara (Open-Meteo / CAMS) ------------- */
 type WindPt = { lon: number; lat: number; speed: number; dir: number } // dir = arah ASAL angin (derajat)
@@ -922,7 +926,7 @@ export default function App() {
     const ctrl = new AbortController()
     setLoading(true)
     setError('')
-    fetch(`/api/fires?days=${days}&source=${source}`, { signal: ctrl.signal })
+    fetch(`${API_BASE}/api/fires?days=${days}&source=${source}`, { signal: ctrl.signal })
       .then(async (r) => {
         if (!r.ok) throw new Error(await r.text())
         return r.json() as Promise<Fires>
