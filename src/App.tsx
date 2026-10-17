@@ -17,7 +17,6 @@ const raster = (tiles: string[], attribution: string, maxzoom = 18): StyleSpecif
   layers: [{ id: 'base', type: 'raster', source: 'base' }],
 })
 const CARTO_ATTR = '© OpenStreetMap contributors © CARTO'
-/* API key CARTO Basemaps: isi VITE_CARTO_KEY di frontend/.env (lihat transformRequest di bawah) */
 const CARTO_KEY = (import.meta.env.VITE_CARTO_KEY as string | undefined)?.trim()
 const sub = (style: string) => [`https://basemaps.cartocdn.com/rastertiles/${style}/{z}/{x}/{y}.png`]
 
