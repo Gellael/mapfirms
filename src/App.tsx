@@ -1883,6 +1883,7 @@ export default function App() {
           {loading && <div className="loading">Memuat titik panas…</div>}
           {geoState === 'none' && <div className="toast toast2">GeoJSON wilayah tidak ditemukan di {GEO_URL.prov} / {GEO_URL.kota}. Sementara memakai batas pulau perkiraan.</div>}
           {hoverName && mode === 'area' && <div className="hovertag">{hoverName}</div>}
+          <div className="legends">
           {vis.aq && (
             <div className="aqlegend">
               <div className="aql-h">
@@ -1931,6 +1932,7 @@ export default function App() {
               )}
             </div>
           )}
+          </div>
 
           <div className="dock">
             <button className="dk-play" disabled={!times.length} onClick={() => setPlaying((v) => !v)} title={playing ? 'Jeda' : 'Putar per jam'} aria-label={playing ? 'Jeda' : 'Putar per jam'}>
