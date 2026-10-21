@@ -315,6 +315,18 @@ const toAqH = (c: AqRaw): AqH => ({
   }),
 })
 
+/* Copernicus ADS (CAMS global forecast): JSON statis hasil scripts/fetch_ads_aerosol.py (diperbarui otomatis oleh GitHub Actions).
+   Bentuknya sama dengan AqRaw; ADS tidak punya konsentrasi debu permukaan, jadi 'dust' diisi nol dan disembunyikan di UI. */
+async function fetchAdsRaw(): Promise<AqRaw> {
+  const r = await fetch(`/data/aerosol_ads.json?ts=${Math.floor(Date.now() / 600000)}`)
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  const j = await r.json()
+  const n = NX * NY
+  if (!Array.isArray(j.t) || !j.v?.pm25 || j.v.pm25[0]?.length !== n) throw new Error('format ADS tidak cocok')
+  j.v.dust = j.t.map(() => new Array(n).fill(0))
+  return { t: j.t, v: j.v } as AqRaw
+}
+
 async function cached<T>(key: string, load: () => Promise<T>, maxAge = 25 * 60 * 1000): Promise<T> {
   try {
     const c = JSON.parse(localStorage.getItem(key) || 'null')
@@ -397,7 +409,8 @@ function fitArea(map: MLMap | null, g: Geo | null, i: number, l: Level) {
 
 type Acc = { n: number; frp: number; high: number; max: number; dates: Record<string, number> }
 type VisKey = 'radius' | 'wind' | 'smoke' | 'trail' | 'aq' | 'points' | 'choro' | 'borders'
-const VIS0: Record<VisKey, boolean> = { radius: true, wind: true, smoke: true, trail: true, aq: true, points: true, choro: true, borders: true }
+/* awal aktif: titik api, plume asap, polusi udara, batas wilayah, warna per wilayah; sisanya dicentang manual lewat panel Lapisan */
+const VIS0: Record<VisKey, boolean> = { radius: false, wind: false, smoke: true, trail: false, aq: true, points: true, choro: true, borders: true }
 const LAYER_LIST: [VisKey, string][] = [
   ['points', 'Titik api'], ['radius', 'Radius panas'],
   ['smoke', 'Plume asap'], ['trail', 'Jejak asap per jam'], ['aq', 'Polusi udara (CAMS)'], ['wind', 'Aliran angin'],
@@ -456,6 +469,8 @@ export default function App() {
   const [windErr, setWindErr] = useState('')
   const [aqH, setAqH] = useState<AqH | null>(null)
   const [aqErr, setAqErr] = useState('')
+  const [aqSrc, setAqSrc] = useState<'openmeteo' | 'ads'>('openmeteo')
+  const [infoOpen, setInfoOpen] = useState(false)
   const [hour, setHour] = useState(nowKey)
   const [playing, setPlaying] = useState(false)
   const [proj, setProj] = useState<Proj>('mercator')
@@ -475,6 +490,14 @@ export default function App() {
   const smokeRef = useRef<HTMLCanvasElement>(null)
   const aqCvRef = useRef<HTMLCanvasElement>(null)
   const showDbg = useMemo(() => new URLSearchParams(location.search).has('debug'), [])
+
+  /* tutup dialog info sumber data dengan tombol Esc */
+  useEffect(() => {
+    if (!infoOpen) return
+    const k = (e: KeyboardEvent) => { if (e.key === 'Escape') setInfoOpen(false) }
+    window.addEventListener('keydown', k)
+    return () => window.removeEventListener('keydown', k)
+  }, [infoOpen])
 
   /* jam terpilih → angin & polusi pada jam itu */
   const times = useMemo(() => windH?.t ?? aqH?.t ?? [], [windH, aqH])
@@ -989,14 +1012,14 @@ export default function App() {
     let dead = false
     const load = async () => {
       try {
-        const d = toAqH(await cached('fw-aqh1', fetchAqRaw))
+        const d = toAqH(aqSrc === 'ads' ? await fetchAdsRaw() : await cached('fw-aqh1', fetchAqRaw))
         if (!dead) { setAqH(d); setAqErr('') }
-      } catch { if (!dead) setAqErr('Data polusi udara gagal dimuat') }
+      } catch { if (!dead) setAqErr(aqSrc === 'ads' ? 'Data ADS belum tersedia (skrip pembaruan belum berjalan?)' : 'Data polusi udara gagal dimuat') }
     }
     load()
     const t = window.setInterval(load, 30 * 60 * 1000)
     return () => { dead = true; window.clearInterval(t) }
-  }, [])
+  }, [aqSrc])
 
   /* lapisan polusi udara: medan CAMS diinterpolasi halus ke seluruh layar */
   useEffect(() => {
@@ -1472,6 +1495,7 @@ export default function App() {
           <div className="map-actions">
             <button onClick={() => focus(INDONESIA)}>Fokus Indonesia</button>
             <button onClick={flyToBiggest}>Api terbesar</button>
+            <button onClick={() => setInfoOpen(true)}>Info sumber data</button>
           </div>
 
           <div className="leftbar">
@@ -1507,9 +1531,13 @@ export default function App() {
             <div className="aqlegend">
               <div className="aql-h">
                 <select className="sel sm" value={aqVar} onChange={(e) => setAqVar(e.target.value as AqKey)} title="Variabel polusi udara" aria-label="Variabel polusi udara">
-                  {(Object.keys(AQ_DEF) as AqKey[]).map((k) => <option key={k} value={k}>{AQ_DEF[k].label}</option>)}
+                  {(Object.keys(AQ_DEF) as AqKey[]).filter((k) => aqSrc === 'openmeteo' || k !== 'dust').map((k) => <option key={k} value={k}>{AQ_DEF[k].label}</option>)}
                 </select>
                 <span>{aqDef.unit || 'tanpa satuan'}</span>
+              </div>
+              <div className="seg block" style={{ margin: '0 0 8px' }} role="group" aria-label="Sumber data aerosol">
+                <button className={aqSrc === 'openmeteo' ? 'on' : ''} onClick={() => setAqSrc('openmeteo')}>Open-Meteo</button>
+                <button className={aqSrc === 'ads' ? 'on' : ''} onClick={() => { setAqSrc('ads'); setAqVar((v) => (v === 'dust' ? 'pm25' : v)) }}>Copernicus ADS</button>
               </div>
               <div className="aql-bar" style={{ background: AQ_LEGEND }} />
               <div className="aql-t">
@@ -1779,6 +1807,48 @@ export default function App() {
             )}
             {mode === 'area' && !detail && hasGeo && <div className="hint">Klik sebuah wilayah di peta untuk melihat detailnya.</div>}
           </section>
+
+          {infoOpen && (
+          <div className="modal-bg" onClick={() => setInfoOpen(false)}>
+          <section className="card modal" role="dialog" aria-modal="true" aria-label="Sumber data dan cara penghitungan" onClick={(e) => e.stopPropagation()}>
+            <div className="dt-head">
+              <div className="card-h">Sumber data & cara penghitungan</div>
+              <button className="x" onClick={() => setInfoOpen(false)} title="Tutup">✕</button>
+            </div>
+            <p className="card-d">Dari mana tiap angka berasal dan bagaimana dihitung. Ketuk judul untuk membuka.</p>
+            <details className="src">
+              <summary>Titik panas (NASA FIRMS)</summary>
+              <p><b>Sumber:</b> NASA FIRMS (Fire Information for Resource Management System), deteksi near-real-time dari sensor VIIRS (S-NPP, NOAA-20, NOAA-21; resolusi 375 m) dan MODIS (1 km). Server mengambil data CSV untuk kotak Indonesia lalu menyimpannya di cache 10 menit.</p>
+              <p><b>Penghitungan:</b> tiap titik dicocokkan ke poligon provinsi dan kota/kabupaten (point-in-polygon, Turf.js); titik di luar batas Indonesia dibuang. Keyakinan: VIIRS memakai huruf l/n/h, MODIS memakai angka (&lt; 30 rendah, 30–79 sedang, ≥ 80 tinggi). FRP = energi radiasi api (MW) dari satelit; "Total FRP" adalah jumlah FRP semua titik, "FRP tertinggi" nilai maksimumnya. Waktu UTC dikonversi ke WIB.</p>
+            </details>
+            <details className="src">
+              <summary>Radius panas & analisis radius</summary>
+              <p>Lingkaran tipis di sekitar titik api = perkiraan jangkauan panas, dengan jari-jari 0,4 km + 0,25 km × √FRP (visual, bukan ukuran area terbakar). Pada mode Radius, titik dalam lingkaran dari titik yang Anda klik dihitung dengan Turf.js (<i>pointsWithinPolygon</i>).</p>
+            </details>
+            <details className="src">
+              <summary>Angin permukaan</summary>
+              <p><b>Sumber:</b> Open-Meteo Forecast API (model cuaca global), angin 10 m, per jam, grid 2° (±220 km) yang menutupi Indonesia. Zona waktu Asia/Jakarta, dari kemarin sampai besok.</p>
+              <p><b>Penghitungan:</b> arah dari API adalah arah ASAL angin, lalu dibalik 180° menjadi arah TUJUAN. Kecepatan dan arah diubah ke komponen (u, v), lalu diinterpolasi bilinear di antara titik grid. Angin rata-rata = rata-rata vektor seluruh grid. Partikel garis angin digerakkan dengan integrasi RK2.</p>
+            </details>
+            <details className="src">
+              <summary>Polusi udara & aerosol (PM2.5, PM10, debu, AOD)</summary>
+              <p><b>Sumber:</b> Open-Meteo Air Quality API, domain CAMS Global (Copernicus/ECMWF, resolusi sekitar 45 km), per jam, grid yang sama dengan angin.</p>
+              <p><b>Penghitungan:</b> nilai diinterpolasi halus ke seluruh layar. "PM2.5 di titik api" = rata-rata PM2.5 grid pada lokasi titik-titik api (disampel maksimal ±1.500 titik). Kategori mengikuti ambang PM2.5 (Baik &lt; 9, Sedang &lt; 35,5, Tidak sehat bagi kelompok sensitif &lt; 55,5, Tidak sehat &lt; 125,5, Sangat tidak sehat &lt; 225,5, Berbahaya di atasnya). AOD = ketebalan optis aerosol (tanpa satuan). Ini keluaran model, bukan pengukuran stasiun.</p>
+              <p><b>Opsi sumber ADS:</b> Anda bisa memilih Copernicus Atmosphere Data Store (prakiraan CAMS Global resmi, run 00 UTC) lewat panel Lapisan. Data diambil otomatis dua kali sehari oleh skrip terjadwal, diinterpolasi ke grid 2° dan per jam (dari langkah 3 jam). Tersedia PM2.5, PM10, dan AOD; konsentrasi debu tidak tersedia di sumber ini. Jam sebelum run tertua mengikuti nilai terdekat.</p>
+            </details>
+            <details className="src">
+              <summary>Plume asap & jejak asap per jam</summary>
+              <p><b>Plume:</b> simulasi visual. Ribuan partikel dilepas dari titik api (titik ber-FRP besar lebih sering, dibobot √FRP), dibawa angin jam terpilih, dan makin menyebar seiring umur. Kepadatan partikel dijumlahkan per sel layar lalu diwarnai peach → magenta → ungu. Bukan pengukuran asap.</p>
+              <p><b>Jejak per jam:</b> dari titik api terbesar, posisi digeser angin jam demi jam (kecepatan km/j × 1 jam, dikonversi ke derajat dengan koreksi lintang), maksimal 24 jam ke depan. Arah asap dominan = rata-rata vektor angin di titik api, dibobot √FRP.</p>
+            </details>
+            <details className="src">
+              <summary>Batas wilayah & basemap</summary>
+              <p>Batas provinsi dan kota/kabupaten dari berkas GeoJSON di aplikasi ini. Warna per wilayah (choropleth) memetakan jumlah titik ke gradasi merah. Basemap: Carto, Esri, NASA GIBS, OpenFreeMap.</p>
+            </details>
+            <p className="note">Jam setelah "Sekarang" adalah prakiraan model. Data ini bukan pengganti peringatan resmi BMKG/KLHK atau stasiun pemantau lokal.</p>
+          </section>
+          </div>
+          )}
 
           <section className="card">
             <div className="card-h">Legenda</div>

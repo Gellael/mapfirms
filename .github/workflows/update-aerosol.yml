@@ -1,0 +1,30 @@
+name: Perbarui data aerosol ADS
+
+on:
+  schedule:
+    - cron: "30 10 * * *"   # run CAMS 00Z biasanya sudah tersedia di ADS pada jam ini (UTC)
+    - cron: "30 22 * * *"   # percobaan ulang bila yang pertama belum tersedia
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cdsapi xarray netcdf4 numpy pandas scipy
+      - run: python scripts/fetch_ads_aerosol.py
+        env:
+          ADS_KEY: ${{ secrets.ADS_KEY }}
+      - name: Commit hasil
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add public/data/aerosol_ads.json
+          git diff --staged --quiet || (git commit -m "Perbarui data aerosol ADS" && git push)
