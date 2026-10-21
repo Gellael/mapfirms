@@ -1833,9 +1833,6 @@ export default function App() {
             <button onClick={() => focus(INDONESIA)}>Fokus Indonesia</button>
             <button onClick={flyToBiggest}>Api terbesar</button>
             <button onClick={() => setInfoOpen(true)}>Info sumber data</button>
-            <button onClick={share} title="Salin tautan yang menyimpan wilayah, jam, dan lapisan">{copied ? 'Tautan disalin ✓' : 'Bagikan tautan'}</button>
-            <button onClick={() => exportFires('csv')} disabled={!srcFires.length} title={sel ? 'Titik di wilayah terpilih' : 'Titik yang sedang tampil'}>Unduh CSV</button>
-            <button onClick={() => exportFires('geojson')} disabled={!srcFires.length} title={sel ? 'Titik di wilayah terpilih' : 'Titik yang sedang tampil'}>Unduh GeoJSON</button>
           </div>
 
           <div className="leftbar">
@@ -1903,12 +1900,12 @@ export default function App() {
                 {[0, 2, 4, 6].map((i) => <span key={i}>{aqDef.stops[i] >= 100 ? Math.round(aqDef.stops[i]) : aqDef.stops[i]}{i === 6 ? '+' : ''}</span>)}
               </div>
               {(aqVar === 'pm25' || aqVar === 'pm10') && (
-                <div className="aql-ispu" title="Kategori ISPU (Permen LHK P.14/2020), batas atas konsentrasi rata-rata 24 jam">
-                  <small>Kategori ISPU</small>
+                <details className="aql-ispu">
+                  <summary title="Kategori ISPU (Permen LHK P.14/2020), batas atas konsentrasi rata-rata 24 jam">Kategori ISPU</summary>
                   {ISPU_CAT.map((c, i) => (
                     <span key={c.t}><i style={{ background: c.c }} />{c.t}{i < 4 ? ` ≤ ${fmtId(ISPU_X[aqVar][i + 1])}` : ` > ${fmtId(ISPU_X[aqVar][4])}`}</span>
                   ))}
-                </div>
+                </details>
               )}
             </div>
           )}
@@ -1987,6 +1984,11 @@ export default function App() {
             <i className={sheet === 'peek' ? 'chev up' : 'chev'} />
           </button>
           <h2 className="st-title">Statistik</h2>
+          <div className="share-row" role="group" aria-label="Bagikan dan unduh">
+            <button onClick={share} title="Salin tautan yang menyimpan wilayah, jam, dan lapisan">{copied ? 'Tautan disalin ✓' : 'Bagikan tautan'}</button>
+            <button onClick={() => exportFires('csv')} disabled={!srcFires.length} title={sel ? 'Titik di wilayah terpilih' : 'Titik yang sedang tampil'}>Unduh CSV</button>
+            <button onClick={() => exportFires('geojson')} disabled={!srcFires.length} title={sel ? 'Titik di wilayah terpilih' : 'Titik yang sedang tampil'}>Unduh GeoJSON</button>
+          </div>
           {error && <div className="err">{error}</div>}
 
           {detail && (

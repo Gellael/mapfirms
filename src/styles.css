@@ -438,3 +438,16 @@ body { overflow: hidden; overscroll-behavior: none; }
   .crumb { display: none; }
   .rlegend { right: 8px; bottom: calc(var(--peek) + 210px); width: 190px; }
 }
+
+/* ---------- perbaikan tata letak ---------- */
+.leftbar { overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--line2) transparent; }
+.leftbar > .panel { flex: none; }
+.layers { overflow-y: visible; }
+.share-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+.share-row button { height: 32px; padding: 0 6px; border-radius: var(--r-ctl); border: 1px solid var(--line2); background: var(--surface); font-size: 12px; white-space: nowrap; }
+.share-row button:hover:not(:disabled) { background: var(--raised); }
+.share-row button:disabled { opacity: .4; cursor: not-allowed; }
+.aql-ispu summary { cursor: pointer; color: var(--muted); font-size: 11px; list-style: none; }
+.aql-ispu summary::before { content: '▸ '; }
+.aql-ispu[open] summary::before { content: '▾ '; }
+.aql-ispu[open] summary { margin-bottom: 4px; }
