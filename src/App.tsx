@@ -3,7 +3,7 @@ import { Map as MLMap, Marker, Popup, NavigationControl, ScaleControl, setWorker
 import type { StyleSpecification, GeoJSONSource, MapMouseEvent, MapLayerMouseEvent } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import * as turf from '@turf/turf'
-import type { Feature, FeatureCollection, Point } from 'geojson'
+import type { Feature, FeatureCollection, Point, Polygon, MultiPolygon } from 'geojson'
 
 // Worker MapLibre disajikan Vite sebagai file terpisah (perbaikan "Worker failed to load").
 // maplibre-gl v5 tidak punya maplibre-gl-worker.mjs; file yang ada adalah versi CSP.
@@ -254,6 +254,73 @@ const PM_BANDS = [
 ]
 const pmBand = (v: number) => PM_BANDS.find((b) => v <= b.max) ?? PM_BANDS[PM_BANDS.length - 1]
 
+/* ---------- ISPU (Permen LHK No. P.14/MENLHK/SETJEN/KUM.1/7/2020) ----------
+   Kategori: 0-50 Baik, 51-100 Sedang, 101-200 Tidak sehat, 201-300 Sangat tidak sehat, >300 Berbahaya.
+   Batas atas konsentrasi (µg/m³, rata-rata 24 jam) untuk ISPU 50/100/200/300/500.
+   PM2.5 terverifikasi dari sumber sekunder (15,5 / 55,4 / 150,4 / 250,4); PM10 (50/150/350/420) dari
+   Lampiran I peraturan: cocokkan sekali lagi dengan PDF resmi sebelum dipublikasikan. */
+const ISPU_I = [0, 50, 100, 200, 300, 500]
+const ISPU_X: Record<'pm25' | 'pm10', number[]> = {
+  pm25: [0, 15.5, 55.4, 150.4, 250.4, 500],
+  pm10: [0, 50, 150, 350, 420, 500],
+}
+const ISPU_CAT = [
+  { t: 'Baik', c: '#22c55e', tc: '#4ade80' },
+  { t: 'Sedang', c: '#3b82f6', tc: '#60a5fa' },
+  { t: 'Tidak sehat', c: '#facc15', tc: '#facc15' },
+  { t: 'Sangat tidak sehat', c: '#ef4444', tc: '#f87171' },
+  { t: 'Berbahaya', c: '#111827', tc: '#e5e7eb' },
+]
+function ispuOf(k: 'pm25' | 'pm10', v: number) {
+  const X = ISPU_X[k]
+  const x = Math.min(Math.max(0, v), X[5])
+  let i = 0
+  while (i < 4 && x > X[i + 1]) i++
+  const idx = Math.round(ISPU_I[i] + ((ISPU_I[i + 1] - ISPU_I[i]) / (X[i + 1] - X[i])) * (x - X[i]))
+  return { idx, ...ISPU_CAT[i] }
+}
+function Ispu({ k, v }: { k: 'pm25' | 'pm10'; v: number }) {
+  const s = ispuOf(k, v)
+  return (
+    <span className="ispu">
+      <i style={{ background: s.c }} />ISPU {s.idx} <b style={{ color: s.tc }}>{s.t}</b>
+    </span>
+  )
+}
+
+/* ---------- Lapisan raster dari Google Earth Engine (lewat backend) ---------- */
+type RKey = 'co' | 'burned'
+const RASTER: Record<RKey, { endpoint: string; opacity: number }> = {
+  co: { endpoint: '/api/co-tiles', opacity: 0.72 },
+  burned: { endpoint: '/api/burned-tiles', opacity: 0.85 },
+}
+/* Legenda CO mengikuti ekspresi di backend/src/co_expression.json: samakan min/max/palet bila Anda mengubahnya. */
+const CO_MAX = 0.05 // mol/m²
+const CO_GRAD = 'linear-gradient(90deg,#000000,#0000ff,#800080,#00ffff,#00ff00,#ffff00,#ff0000)'
+const BURN_COLOR = '#ff2d95'
+
+/* ---------- Klien perhitungan zonal (luas terbakar, populasi) ---------- */
+async function zonalCall(kind: 'burned' | 'pop', coords: number[][][][]): Promise<number> {
+  const r = await fetch(`${API_BASE}/api/zonal/${kind}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coords }),
+  })
+  if (!r.ok) throw new Error(await r.text())
+  const j = await r.json()
+  if (typeof j.value !== 'number') throw new Error('respons tidak berisi nilai')
+  return j.value
+}
+const toMulti = (g: Polygon | MultiPolygon): number[][][][] => (g.type === 'Polygon' ? [g.coordinates] : g.coordinates)
+function simplMulti(f: Feature<Polygon | MultiPolygon>): number[][][][] {
+  for (const tol of [0.01, 0.03, 0.08, 0.2]) {
+    const sm = turf.simplify(f, { tolerance: tol, highQuality: false }) as Feature<Polygon | MultiPolygon>
+    const c = toMulti(sm.geometry)
+    if (JSON.stringify(c).length < 700_000) return c
+  }
+  return toMulti(f.geometry)
+}
+const normName = (x: string) => x.toLowerCase().replace(/^(kabupaten|kab\.?|kota)\s+/, '').replace(/\s+/g, ' ').trim()
+const fmtId = (v: number) => String(v).replace('.', ',')
+
 /* ------------- Data per jam (WIB): kemarin 00:00 s/d besok 23:00 -------------
    Angin   : Open-Meteo Forecast API (model cuaca global, 10 m, km/j)
    Polusi  : Open-Meteo Air Quality API, domain CAMS Global (Copernicus/ECMWF, ±45 km)
@@ -386,6 +453,7 @@ function popupHtml(p: any, w: WindPt | null, pm: number | null): string {
     <div class="pop-row"><span>FRP</span><b>${p.frp} MW</b></div>
     <div class="pop-row"><span>Pengamatan</span><b>${dn}</b></div>
     ${pm != null ? `<div class="pop-row"><span>PM2.5 (CAMS)</span><b>${Math.round(pm)} µg/m³</b></div>` : ''}
+    ${pm != null ? `<div class="pop-row"><span>ISPU PM2.5</span><b>${ispuOf('pm25', pm).idx} • ${ispuOf('pm25', pm).t}</b></div>` : ''}
     ${w ? `<div class="pop-row"><span>Arah asap</span><b>${Math.round(w.speed)} km/j → ${compass(w.dir + 180)}</b></div>` : ''}</div>`
 }
 
@@ -408,13 +476,14 @@ function fitArea(map: MLMap | null, g: Geo | null, i: number, l: Level) {
 }
 
 type Acc = { n: number; frp: number; high: number; max: number; dates: Record<string, number> }
-type VisKey = 'radius' | 'wind' | 'smoke' | 'trail' | 'aq' | 'points' | 'choro' | 'borders'
+type VisKey = 'radius' | 'wind' | 'smoke' | 'trail' | 'aq' | 'points' | 'choro' | 'borders' | 'co' | 'burned'
 /* awal aktif: titik api, plume asap, polusi udara, batas wilayah, warna per wilayah; sisanya dicentang manual lewat panel Lapisan */
-const VIS0: Record<VisKey, boolean> = { radius: false, wind: false, smoke: true, trail: false, aq: true, points: true, choro: true, borders: true }
+const VIS0: Record<VisKey, boolean> = { radius: false, wind: false, smoke: true, trail: false, aq: true, points: true, choro: true, borders: true, co: false, burned: false }
 const LAYER_LIST: [VisKey, string][] = [
   ['points', 'Titik api'], ['radius', 'Radius panas'],
   ['smoke', 'Plume asap'], ['trail', 'Jejak asap per jam'], ['aq', 'Polusi udara (CAMS)'], ['wind', 'Aliran angin'],
   ['borders', 'Batas wilayah'], ['choro', 'Warna per wilayah'],
+  ['co', 'Karbon monoksida (TROPOMI)'], ['burned', 'Area terbakar (MODIS)'],
 ]
 
 /* ekspresi warna isi poligon: terpilih > hover > choropleth jumlah titik */
@@ -426,6 +495,35 @@ const fillExpr = (max: number, choro: boolean) => [
     ? ['interpolate', ['linear'], ['to-number', ['feature-state', 'n'], 0], 0, 'rgba(239,83,80,0)', Math.max(max, 1), 'rgba(239,83,80,0.34)']
     : 'rgba(0,0,0,0.01)',
 ]
+
+/* ------------------- State awal dari URL (tautan bagikan) ------------------- */
+const SRC_LIST = ['VIIRS_SNPP_NRT', 'VIIRS_NOAA20_NRT', 'VIIRS_NOAA21_NRT', 'MODIS_NRT']
+const SAT_NAME: Record<string, string> = { N: 'S-NPP', N20: 'NOAA-20', N21: 'NOAA-21', Terra: 'Terra', Aqua: 'Aqua' }
+const URLQ = new URLSearchParams(location.search)
+const qNum = (k: string, lo: number, hi: number, d: number) => {
+  const raw = URLQ.get(k); const v = raw == null ? NaN : Number(raw)
+  return Number.isFinite(v) && v >= lo && v <= hi ? Math.round(v) : d
+}
+const INIT = {
+  vis: (() => {
+    const ly = URLQ.get('ly')
+    if (ly == null) return VIS0
+    const on = new Set(ly.split(','))
+    return Object.fromEntries((Object.keys(VIS0) as VisKey[]).map((k) => [k, on.has(k)])) as Record<VisKey, boolean>
+  })(),
+  days: qNum('d', 1, 5, 1),
+  source: SRC_LIST.includes(URLQ.get('src') ?? '') ? (URLQ.get('src') as string) : 'VIIRS_SNPP_NRT',
+  minLevel: qNum('k', 0, 2, 0),
+  minFrp: qNum('frp', 0, 100, 0),
+  sat: URLQ.get('sat') ?? '',
+  hour: /^\d{4}-\d{2}-\d{2}T\d{2}:00$/.test(URLQ.get('h') ?? '') ? (URLQ.get('h') as string) : null,
+  aqVar: ((URLQ.get('aq') ?? 'pm25') in AQ_DEF ? (URLQ.get('aq') ?? 'pm25') : 'pm25') as AqKey,
+  w: URLQ.get('w'),
+}
+type Impact = {
+  key: string; busy: boolean; err: string; nFire: number
+  burned?: number; popFire?: number; popPm?: number | null; expKm?: number; thr?: number
+}
 
 /* ------------------------------------ App ----------------------------------- */
 export default function App() {
@@ -439,7 +537,7 @@ export default function App() {
   const lastErr = useRef('')
   const windRef = useRef<WindPt[]>([])
   const aqRef = useRef<AqData | null>(null)
-  const visRef = useRef<Record<VisKey, boolean>>(VIS0)
+  const visRef = useRef<Record<VisKey, boolean>>(INIT.vis)
   const geoRef = useRef<GeoSet>({ prov: null, kota: null })
   const levelRef = useRef<Level>('prov')
   const modeRef = useRef<'area' | 'radius'>('area')
@@ -454,9 +552,9 @@ export default function App() {
   const trailRef = useRef<FeatureCollection>(EMPTY_FC)
 
   const [basemap, setBasemap] = useState(DEFAULT_BASEMAP)
-  const [source, setSource] = useState('VIIRS_SNPP_NRT')
-  const [days, setDays] = useState(1)
-  const [minLevel, setMinLevel] = useState(0)
+  const [source, setSource] = useState(INIT.source)
+  const [days, setDays] = useState(INIT.days)
+  const [minLevel, setMinLevel] = useState(INIT.minLevel)
   const [radiusKm, setRadiusKm] = useState(25)
   const [raw, setRaw] = useState<Fires>(EMPTY)
   const [loading, setLoading] = useState(true)
@@ -471,12 +569,12 @@ export default function App() {
   const [aqErr, setAqErr] = useState('')
   const [aqSrc, setAqSrc] = useState<'openmeteo' | 'ads'>('openmeteo')
   const [infoOpen, setInfoOpen] = useState(false)
-  const [hour, setHour] = useState(nowKey)
+  const [hour, setHour] = useState(() => INIT.hour ?? nowKey())
   const [playing, setPlaying] = useState(false)
   const [proj, setProj] = useState<Proj>('mercator')
   const [layersOpen, setLayersOpen] = useState(() => window.innerWidth > 900)
-  const [aqVar, setAqVar] = useState<AqKey>('pm25')
-  const [vis, setVis] = useState<Record<VisKey, boolean>>(VIS0)
+  const [aqVar, setAqVar] = useState<AqKey>(INIT.aqVar)
+  const [vis, setVis] = useState<Record<VisKey, boolean>>(INIT.vis)
   const [smokeGain, setSmokeGain] = useState(1)
   const [geo, setGeo] = useState<GeoSet>({ prov: null, kota: null })
   const [geoState, setGeoState] = useState<'loading' | 'ok' | 'none'>('loading')
@@ -490,6 +588,21 @@ export default function App() {
   const smokeRef = useRef<HTMLCanvasElement>(null)
   const aqCvRef = useRef<HTMLCanvasElement>(null)
   const showDbg = useMemo(() => new URLSearchParams(location.search).has('debug'), [])
+  const [minFrp, setMinFrp] = useState(INIT.minFrp)
+  const [sat, setSat] = useState(INIT.sat)
+  const [filtOpen, setFiltOpen] = useState(() => INIT.minFrp > 0 || !!INIT.sat)
+  const [rUrl, setRUrl] = useState<Partial<Record<RKey, { url: string }>>>({})
+  const [rErr, setRErr] = useState<Partial<Record<RKey, string>>>({})
+  const rasterRef = useRef<Partial<Record<RKey, { url: string }>>>({})
+  const rFetching = useRef<Partial<Record<RKey, boolean>>>({})
+  const restoreRef = useRef<string | null>(INIT.w)
+  const [q, setQ] = useState('')
+  const [qOpen, setQOpen] = useState(false)
+  const [rankLvl, setRankLvl] = useState<Level>('prov')
+  const [copied, setCopied] = useState(false)
+  const [expKm, setExpKm] = useState(5)
+  const [pmThr, setPmThr] = useState(55.5)
+  const [impact, setImpact] = useState<Impact | null>(null)
 
   /* tutup dialog info sumber data dengan tombol Esc */
   useEffect(() => {
@@ -555,9 +668,19 @@ export default function App() {
     return { type: 'FeatureCollection', features: feats }
   }, [raw, geo])
 
+  /* satelit yang ada pada data sensor terpilih (untuk filter) */
+  const sats = useMemo(() => [...new Set(raw.features.map((f) => String(f.properties.satellite ?? '')).filter(Boolean))].sort(), [raw])
+  useEffect(() => { if (sat && sats.length && !sats.includes(sat)) setSat('') }, [sats, sat])
+
   const filtered = useMemo<Fires>(
-    () => ({ type: 'FeatureCollection', features: indo.features.filter((f) => f.properties._lvl >= minLevel) }),
-    [indo, minLevel]
+    () => ({
+      type: 'FeatureCollection',
+      features: indo.features.filter((f) =>
+        f.properties._lvl >= minLevel &&
+        (Number(f.properties.frp) || 0) >= minFrp &&
+        (!sat || String(f.properties.satellite) === sat)),
+    }),
+    [indo, minLevel, minFrp, sat]
   )
 
   const stats = useMemo(() => {
@@ -644,6 +767,22 @@ export default function App() {
     })
   }, [])
 
+  /* lapisan raster GEE (CO, area terbakar): disisipkan di bawah warna wilayah; URL tile diambil lazy saat dicentang */
+  const applyRasters = useCallback((map: MLMap) => {
+    ;(Object.keys(RASTER) as RKey[]).forEach((k) => {
+      const info = rasterRef.current[k]
+      const id = `r-${k}`
+      if (!info) return
+      const on = visRef.current[k]
+      if (!map.getSource(id)) {
+        if (!on) return
+        map.addSource(id, { type: 'raster', tiles: [info.url], tileSize: 256, maxzoom: 10 })
+        map.addLayer({ id, type: 'raster', source: id, paint: { 'raster-opacity': RASTER[k].opacity } }, map.getLayer('prov-fill') ? 'prov-fill' : undefined)
+      }
+      map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none')
+    })
+  }, [])
+
   /* pasang source + layer; dipanggil setiap style baru selesai dimuat (peta datar, gaya gelap) */
   const ensureLayers = useCallback((map: MLMap) => {
     if (map.getSource('fires')) return
@@ -712,7 +851,8 @@ export default function App() {
     })
     applyVis(map)
     applyGeoState(map)
-  }, [applyVis, applyGeoState])
+    applyRasters(map)
+  }, [applyVis, applyGeoState, applyRasters])
 
   /* analisis Turf: radius dari titik klik */
   const analyze = useCallback(() => {
@@ -857,6 +997,7 @@ export default function App() {
         return
       }
       center.current = [e.lngLat.lng, e.lngLat.lat]
+      setImpact(null)
       analyze()
     })
 
@@ -882,6 +1023,17 @@ export default function App() {
       setGeoState(prov || kota ? 'ok' : 'none')
       if (!prov && kota) { levelRef.current = 'kota'; setLvl('kota') }
       if (!prov && !kota) { modeRef.current = 'radius'; setMode('radius') }
+      const w = restoreRef.current
+      if (w) {
+        restoreRef.current = null
+        const [lv2, name, parent] = w.split('|')
+        const g = lv2 === 'kota' ? kota : prov
+        if (g) {
+          let i = g.names.findIndex((n, k) => n === name && (!parent || g.parents[k] === parent))
+          if (i < 0) i = g.names.findIndex((n) => n === name)
+          if (i >= 0) window.setTimeout(() => selectArea(lv2 as Level, i), 0)
+        }
+      }
     })()
     return () => { dead = true }
   }, [])
@@ -992,6 +1144,47 @@ export default function App() {
   }, [vis, applyVis, applyGeoState])
 
   useEffect(() => { gainRef.current = smokeGain }, [smokeGain])
+
+  /* ambil URL tile GEE hanya saat lapisannya pertama kali dicentang (menghemat kuota Earth Engine) */
+  useEffect(() => {
+    ;(Object.keys(RASTER) as RKey[]).forEach((k) => {
+      if (!vis[k] || rUrl[k] || rFetching.current[k]) return
+      rFetching.current[k] = true
+      fetch(`${API_BASE}${RASTER[k].endpoint}`)
+        .then(async (r) => { if (!r.ok) throw new Error(await r.text()); return r.json() })
+        .then((j) => { if (!j.url) throw new Error('respons tanpa url'); setRUrl((u) => ({ ...u, [k]: { url: j.url } })); setRErr((e) => ({ ...e, [k]: '' })) })
+        .catch((e: Error) => setRErr((x) => ({ ...x, [k]: String(e.message || e).slice(0, 140) })))
+        .finally(() => { rFetching.current[k] = false })
+    })
+  }, [vis, rUrl])
+
+  useEffect(() => {
+    rasterRef.current = rUrl
+    const m = mapRef.current
+    if (!m) return
+    try { applyRasters(m) } catch { /* style belum siap: ensureLayers akan memanggil ulang */ }
+  }, [rUrl, vis, applyRasters])
+
+  /* tautan bagikan: pilihan disimpan di query string (replaceState, tanpa menambah riwayat) */
+  useEffect(() => {
+    if (playing) return
+    const p = new URLSearchParams(location.search)
+    const put = (k: string, v: string | null) => { if (v == null || v === '') p.delete(k); else p.set(k, v) }
+    put('d', days !== 1 ? String(days) : null)
+    put('src', source !== 'VIIRS_SNPP_NRT' ? source : null)
+    put('k', minLevel ? String(minLevel) : null)
+    put('frp', minFrp ? String(minFrp) : null)
+    put('sat', sat || null)
+    put('h', hour !== nowKey() ? hour : null)
+    put('aq', aqVar !== 'pm25' ? aqVar : null)
+    p.set('ly', (Object.keys(vis) as VisKey[]).filter((k) => vis[k]).join(','))
+    if (!restoreRef.current) {
+      const g = sel ? geo[sel.level] : null
+      put('w', sel && g ? [sel.level, g.names[sel.idx], sel.level === 'kota' ? g.parents[sel.idx] : ''].join('|') : null)
+    }
+    const qs = p.toString()
+    history.replaceState(null, '', qs ? `?${qs}` : location.pathname)
+  }, [days, source, minLevel, minFrp, sat, hour, aqVar, vis, sel, geo, playing])
 
   /* angin per jam (Open-Meteo Forecast), disegarkan tiap 30 menit */
   useEffect(() => {
@@ -1270,18 +1463,19 @@ export default function App() {
     const acc: Acc = (sel.level === 'prov' ? stats.byProv : stats.byKota).get(sel.idx) ?? { n: 0, frp: 0, high: 0, max: 0, dates: {} }
     const b = g.bb[sel.idx]
     const cLon = (b[0] + b[2]) / 2, cLat = (b[1] + b[3]) / 2
-    let pm25: number | null = null, aod: number | null = null
+    let pm25: number | null = null, pm10: number | null = null, aod: number | null = null
     if (aq) {
       const key = sel.level === 'prov' ? '_pi' : '_ki'
-      let s1 = 0, s2 = 0, n = 0
+      let s1 = 0, s2 = 0, s3 = 0, n = 0
       for (const f of filtered.features) {
         if (f.properties[key] !== sel.idx) continue
         const [lon, lat] = f.geometry.coordinates
-        s1 += sampleGrid(aq.pm25, lon, lat); s2 += sampleGrid(aq.aod, lon, lat); n++
+        s1 += sampleGrid(aq.pm25, lon, lat); s2 += sampleGrid(aq.aod, lon, lat); s3 += sampleGrid(aq.pm10, lon, lat); n++
         if (n >= 400) break
       }
       pm25 = n ? s1 / n : sampleGrid(aq.pm25, cLon, cLat)
       aod = n ? s2 / n : sampleGrid(aq.aod, cLon, cLat)
+      pm10 = n ? s3 / n : sampleGrid(aq.pm10, cLon, cLat)
     }
     let w: { speed: number; dir: number } | null = null
     if (wind.length === NX * NY) {
@@ -1298,7 +1492,7 @@ export default function App() {
     }
     return {
       level: sel.level, idx: sel.idx, name: g.names[sel.idx], parent: sel.level === 'kota' ? g.parents[sel.idx] : '',
-      acc, pm25, aod, wind: w, dates, dmax: Math.max(1, ...dates.map((d) => acc.dates[d])), top, bbox: b,
+      acc, pm25, pm10, aod, wind: w, dates, dmax: Math.max(1, ...dates.map((d) => acc.dates[d])), top, bbox: b,
     }
   }, [sel, geo, stats, aq, wind, filtered])
 
@@ -1407,10 +1601,11 @@ export default function App() {
     })
   })()
 
-  /* daftar sebaran: provinsi teratas bila GeoJSON ada, kalau tidak per pulau */
-  const rows = geo.prov
-    ? [...stats.byProv.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 10).map(([i, a]) => ({
-        key: `p${i}`, label: geo.prov!.names[i], n: a.n, color: 'linear-gradient(90deg,#ef5350,#ff8a65)', go: () => selectArea('prov', i),
+  /* peringkat: provinsi atau kabupaten/kota teratas bila GeoJSON ada, kalau tidak per pulau */
+  const rankG: Level | null = geo.kota && (rankLvl === 'kota' || !geo.prov) ? 'kota' : geo.prov ? 'prov' : null
+  const rows = rankG
+    ? [...(rankG === 'kota' ? stats.byKota : stats.byProv).entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 10).map(([i, a]) => ({
+        key: `${rankG}${i}`, label: geo[rankG]!.names[i], n: a.n, color: 'linear-gradient(90deg,#ef5350,#ff8a65)', go: () => selectArea(rankG, i),
       }))
     : REGIONS.map((r) => ({ key: r.id, label: r.id, n: stats.byIsland[r.id].n, color: r.color, go: () => focus(r.bounds) }))
   const rowMax = Math.max(1, ...rows.map((r) => r.n))
@@ -1418,6 +1613,126 @@ export default function App() {
   const clearRadius = () => {
     center.current = null
     analyze()
+  }
+
+  /* ---- ekspor titik panas yang sedang tampil (wilayah terpilih bila ada, selain itu seluruh Indonesia) ---- */
+  const exportFires = (fmt: 'csv' | 'geojson') => {
+    const fs = srcFires
+    if (!fs.length) return
+    const clean = (p: Record<string, any>) => {
+      const o: Record<string, any> = { ...p, wilayah: p._region ?? '', lokasi: p._place ?? '' }
+      ;['_pi', '_ki', '_lvl', '_island', '_region', '_place'].forEach((k) => delete o[k])
+      return o
+    }
+    let body: string
+    if (fmt === 'geojson') {
+      body = JSON.stringify({ type: 'FeatureCollection', features: fs.map((f) => ({ type: 'Feature', geometry: f.geometry, properties: clean(f.properties) })) })
+    } else {
+      const rows = fs.map((f) => ({ latitude: f.geometry.coordinates[1], longitude: f.geometry.coordinates[0], ...clean(f.properties) }))
+      const cols = [...rows.reduce((st, r) => { Object.keys(r).forEach((k) => st.add(k)); return st }, new Set<string>())]
+      const esc = (v: any) => { const t = v == null ? '' : String(v); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t }
+      body = '\ufeff' + [cols.join(','), ...rows.map((r) => cols.map((c) => esc((r as any)[c])).join(','))].join('\n')
+    }
+    const tag = detail ? `_${detail.name.replace(/[^\w-]+/g, '-')}` : ''
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(new Blob([body], { type: fmt === 'csv' ? 'text/csv;charset=utf-8' : 'application/geo+json' }))
+    a.download = `titik-panas_${source}_${days}hari${tag}.${fmt}`
+    a.click()
+    window.setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+  }
+
+  const share = async () => {
+    const url = location.href
+    try { await navigator.clipboard.writeText(url) } catch { window.prompt('Salin tautan ini:', url) }
+    setCopied(true)
+    window.setTimeout(() => setCopied(false), 1800)
+  }
+
+  /* ---- pencarian wilayah ---- */
+  const searchIdx = useMemo(() => {
+    const out: { level: Level; idx: number; name: string; parent: string; key: string }[] = []
+    ;(['prov', 'kota'] as const).forEach((l) => {
+      const g = geo[l]
+      if (g) g.names.forEach((n, i) => out.push({ level: l, idx: i, name: n, parent: l === 'kota' ? g.parents[i] : '', key: normName(n) }))
+    })
+    return out
+  }, [geo])
+  const results = useMemo(() => {
+    const t = normName(q)
+    if (t.length < 2) return []
+    const a: typeof searchIdx = [], b: typeof searchIdx = []
+    for (const r of searchIdx) { if (r.key.startsWith(t)) a.push(r); else if (r.key.includes(t)) b.push(r) }
+    return [...a, ...b].slice(0, 8)
+  }, [q, searchIdx])
+  const pickResult = (r: { level: Level; idx: number }) => { selectArea(r.level, r.idx); setQ(''); setQOpen(false) }
+
+  /* ---- dampak: luas terbakar (MCD64A1) & penduduk (WorldPop) lewat Earth Engine ---- */
+  const curKey = mode === 'radius' ? (local ? `radius:${radiusKm}` : null) : detail ? `${detail.level}:${detail.name}` : null
+  const imp = impact && impact.key === curKey ? impact : null
+
+  const getScope = () => {
+    if (modeRef.current === 'radius' && center.current) {
+      const poly = turf.circle(center.current, radiusRef.current, { units: 'kilometers', steps: 64 }) as Feature<Polygon>
+      const fires = turf.pointsWithinPolygon(firesRef.current, poly).features as unknown as Feature<Point, Record<string, any>>[]
+      return { poly: poly as Feature<Polygon | MultiPolygon>, fires }
+    }
+    if (sel && geo[sel.level]) {
+      const f = geo[sel.level]!.fc.features[sel.idx] as Feature<Polygon | MultiPolygon>
+      return { poly: f, fires: srcFires }
+    }
+    return null
+  }
+  const fireBuffers = (fs: Feature<Point, Record<string, any>>[], km: number) => {
+    const top = [...fs].sort((a, b) => (Number(b.properties.frp) || 0) - (Number(a.properties.frp) || 0))
+    const sep = km / 111 / 2
+    const kept: [number, number][] = []
+    const out: number[][][][] = []
+    for (const f of top) {
+      const [lo, la] = f.geometry.coordinates
+      if (kept.some((p) => Math.abs(p[0] - lo) < sep && Math.abs(p[1] - la) < sep)) continue
+      kept.push([lo, la])
+      out.push(turf.circle([lo, la], km, { units: 'kilometers', steps: 16 }).geometry.coordinates)
+      if (out.length >= 400) break
+    }
+    return out
+  }
+  /* sel-sel kecil di dalam wilayah yang PM2.5-nya (medan CAMS jam terpilih) di atas ambang */
+  const pmCells = (poly: Feature<Polygon | MultiPolygon>): number[][][][] | null => {
+    const A = aqRef.current
+    if (!A) return null
+    const [w, s0, e, n] = turf.bbox(poly)
+    const st = Math.max(0.1, Math.sqrt(((e - w) * (n - s0)) / 2500))
+    const out: number[][][][] = []
+    for (let lo = w; lo < e; lo += st) {
+      for (let la = s0; la < n; la += st) {
+        const cx = lo + st / 2, cy = la + st / 2
+        if (sampleGrid(A.pm25, cx, cy) < pmThr) continue
+        if (!turf.booleanPointInPolygon([cx, cy], poly)) continue
+        out.push([[[lo, la], [lo + st, la], [lo + st, la + st], [lo, la + st], [lo, la]]])
+      }
+    }
+    return out
+  }
+  const calcImpact = async (what: 'burned' | 'pop') => {
+    const sc = getScope()
+    if (!sc || !curKey) return
+    const key = curKey
+    const base: Impact = impact && impact.key === key ? impact : { key, busy: false, err: '', nFire: 0 }
+    setImpact({ ...base, key, busy: true, err: '', nFire: sc.fires.length })
+    try {
+      if (what === 'burned') {
+        const ha = await zonalCall('burned', simplMulti(sc.poly))
+        setImpact((p) => (p && p.key === key ? { ...p, burned: ha, busy: false } : p))
+      } else {
+        const fb = fireBuffers(sc.fires, expKm)
+        const popFire = fb.length ? await zonalCall('pop', fb) : 0
+        const cells = pmCells(sc.poly)
+        const popPm = cells === null ? null : cells.length ? await zonalCall('pop', cells) : 0
+        setImpact((p) => (p && p.key === key ? { ...p, popFire, popPm, expKm, thr: pmThr, busy: false } : p))
+      }
+    } catch (e) {
+      setImpact((p) => (p && p.key === key ? { ...p, busy: false, err: String((e as Error).message || e).slice(0, 160) } : p))
+    }
   }
 
   const stepSheet = (dir: 1 | -1) =>
@@ -1439,6 +1754,28 @@ export default function App() {
           {detail && detail.parent && <><em>/</em><span>{detail.parent}</span></>}
           {detail && <><em>/</em><span className="cur">{detail.name}</span></>}
         </nav>
+        <div className="search" role="search">
+          <input
+            type="search" value={q} disabled={!(geo.prov || geo.kota)} aria-label="Cari wilayah"
+            placeholder={geo.prov || geo.kota ? 'Cari provinsi atau kabupaten…' : 'GeoJSON wilayah belum dimuat'}
+            onChange={(e) => { setQ(e.target.value); setQOpen(true) }}
+            onFocus={() => setQOpen(true)}
+            onBlur={() => window.setTimeout(() => setQOpen(false), 120)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && results[0]) pickResult(results[0]); if (e.key === 'Escape') { setQ(''); setQOpen(false) } }}
+          />
+          {qOpen && results.length > 0 && (
+            <ul className="search-res">
+              {results.map((r) => (
+                <li key={`${r.level}${r.idx}`}>
+                  <button onMouseDown={(e) => { e.preventDefault(); pickResult(r) }}>
+                    <span>{r.name}</span><small>{r.level === 'prov' ? 'Provinsi' : r.parent || 'Kota/Kab'}</small>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {qOpen && q.trim().length >= 2 && results.length === 0 && <div className="search-res empty">Tidak ditemukan</div>}
+        </div>
         <div className="top-meta">
           <span>{nf.format(indo.features.length)} dari {nf.format(raw.features.length)} titik berada di Indonesia</span>
           <span className="top-status">
@@ -1496,6 +1833,9 @@ export default function App() {
             <button onClick={() => focus(INDONESIA)}>Fokus Indonesia</button>
             <button onClick={flyToBiggest}>Api terbesar</button>
             <button onClick={() => setInfoOpen(true)}>Info sumber data</button>
+            <button onClick={share} title="Salin tautan yang menyimpan wilayah, jam, dan lapisan">{copied ? 'Tautan disalin ✓' : 'Bagikan tautan'}</button>
+            <button onClick={() => exportFires('csv')} disabled={!srcFires.length} title={sel ? 'Titik di wilayah terpilih' : 'Titik yang sedang tampil'}>Unduh CSV</button>
+            <button onClick={() => exportFires('geojson')} disabled={!srcFires.length} title={sel ? 'Titik di wilayah terpilih' : 'Titik yang sedang tampil'}>Unduh GeoJSON</button>
           </div>
 
           <div className="leftbar">
@@ -1521,6 +1861,25 @@ export default function App() {
                 </>
               )}
             </div>
+            <div className="panel layers filters">
+              <button className="panel-h tog" onClick={() => setFiltOpen((o) => !o)} aria-expanded={filtOpen}>
+                <span>Filter titik panas</span>
+                <em>{(minFrp > 0 ? 1 : 0) + (sat ? 1 : 0) || 'semua'}</em>
+                <i className={filtOpen ? 'open' : ''} />
+              </button>
+              {filtOpen && (
+                <div className="flt">
+                  <label htmlFor="frpmin">FRP minimum: <b>{minFrp} MW</b></label>
+                  <input id="frpmin" type="range" min={0} max={100} step={1} value={minFrp} onChange={(e) => setMinFrp(+e.target.value)} />
+                  <label htmlFor="satsel">Satelit</label>
+                  <select id="satsel" className="sel" value={sat} onChange={(e) => setSat(e.target.value)}>
+                    <option value="">Semua satelit</option>
+                    {sats.map((x) => <option key={x} value={x}>{SAT_NAME[x] ?? x}</option>)}
+                  </select>
+                  {(minFrp > 0 || sat) && <button className="ghost" onClick={() => { setMinFrp(0); setSat('') }}>Setel ulang filter</button>}
+                </div>
+              )}
+            </div>
           </div>
 
           {mapWarn && <div className="toast">{mapWarn}</div>}
@@ -1543,6 +1902,36 @@ export default function App() {
               <div className="aql-t">
                 {[0, 2, 4, 6].map((i) => <span key={i}>{aqDef.stops[i] >= 100 ? Math.round(aqDef.stops[i]) : aqDef.stops[i]}{i === 6 ? '+' : ''}</span>)}
               </div>
+              {(aqVar === 'pm25' || aqVar === 'pm10') && (
+                <div className="aql-ispu" title="Kategori ISPU (Permen LHK P.14/2020), batas atas konsentrasi rata-rata 24 jam">
+                  <small>Kategori ISPU</small>
+                  {ISPU_CAT.map((c, i) => (
+                    <span key={c.t}><i style={{ background: c.c }} />{c.t}{i < 4 ? ` ≤ ${fmtId(ISPU_X[aqVar][i + 1])}` : ` > ${fmtId(ISPU_X[aqVar][4])}`}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {(vis.co || vis.burned) && (
+            <div className="rlegend">
+              {vis.co && (
+                <div>
+                  <div className="aql-h"><b>CO kolom total (TROPOMI)</b><span>mol/m²</span></div>
+                  <div className="aql-bar" style={{ background: CO_GRAD }} />
+                  <div className="aql-t"><span>0</span><span>{fmtId(CO_MAX / 2)}</span><span>{fmtId(CO_MAX)}+</span></div>
+                  {!rUrl.co && !rErr.co && <small>Memuat lapisan…</small>}
+                  {rErr.co && <small className="rl-err">Gagal: {rErr.co}</small>}
+                </div>
+              )}
+              {vis.burned && (
+                <div>
+                  <div className="aql-h"><b>Area terbakar (MODIS MCD64A1)</b><span>±120 hari</span></div>
+                  <div className="rl-sw"><i style={{ background: BURN_COLOR }} />Piksel 500 m terdeteksi terbakar (komposit bulanan, tertunda 1–2 bulan)</div>
+                  {!rUrl.burned && !rErr.burned && <small>Memuat lapisan…</small>}
+                  {rErr.burned && <small className="rl-err">Gagal: {rErr.burned}</small>}
+                </div>
+              )}
             </div>
           )}
 
@@ -1620,6 +2009,7 @@ export default function App() {
                   <i className="aq-dot" style={{ background: pmBand(detail.pm25).c }} />
                   <div>
                     <b>PM2.5 ≈ {nf.format(Math.round(detail.pm25))} µg/m³</b> • {pmBand(detail.pm25).t}
+                    <small><Ispu k="pm25" v={detail.pm25} />{detail.pm10 != null && <> • PM10 <Ispu k="pm10" v={detail.pm10} /></>}</small>
                     <small>AOD {detail.aod != null ? detail.aod.toFixed(2) : '-'} • perkiraan model CAMS di sekitar titik api</small>
                   </div>
                 </div>
@@ -1685,11 +2075,13 @@ export default function App() {
                   <small>PM2.5 di titik api</small>
                   <b style={{ color: avgBand?.c }}>{aqStats.avg != null ? nf.format(Math.round(aqStats.avg)) : '-'}<i> µg/m³</i></b>
                   {avgBand && <small className="band">{avgBand.t}</small>}
+                  {aqStats.avg != null && <small className="band"><Ispu k="pm25" v={aqStats.avg} /></small>}
                 </div>
                 <div>
                   <small>PM2.5 tertinggi</small>
                   <b style={{ color: pmBand(aqStats.max).c }}>{nf.format(Math.round(aqStats.max))}<i> µg/m³</i></b>
                   <small className="band">{pmBand(aqStats.max).t}</small>
+                  <small className="band"><Ispu k="pm25" v={aqStats.max} /></small>
                 </div>
               </div>
             ) : <div className="hint">{aqErr || 'Memuat data polusi udara…'}</div>}
@@ -1754,8 +2146,14 @@ export default function App() {
           </section>
 
           <section className="card">
-            <div className="card-h">{geo.prov ? 'Provinsi teratas' : 'Sebaran per wilayah'}</div>
-            <p className="card-d">{geo.prov ? 'Klik baris untuk memilih provinsi dan zoom ke batasnya.' : 'Klik baris untuk zoom ke wilayah.'}</p>
+            <div className="card-h">{rankG === 'kota' ? 'Kabupaten/kota teratas' : rankG === 'prov' ? 'Provinsi teratas' : 'Sebaran per wilayah'}</div>
+            <p className="card-d">{rankG ? 'Klik baris untuk memilih wilayah dan zoom ke batasnya. Mengikuti filter FRP/satelit yang aktif.' : 'Klik baris untuk zoom ke wilayah.'}</p>
+            {geo.prov && geo.kota && (
+              <div className="seg block" role="group" aria-label="Tingkat peringkat" style={{ margin: '0 0 8px' }}>
+                <button className={rankG === 'prov' ? 'on' : ''} onClick={() => setRankLvl('prov')}>Provinsi</button>
+                <button className={rankG === 'kota' ? 'on' : ''} onClick={() => setRankLvl('kota')}>Kab/Kota</button>
+              </div>
+            )}
             {rows.map((r) => (
               <button key={r.key} className="bar-row" onClick={r.go}>
                 <span className="bar-label">{r.label}</span>
@@ -1808,6 +2206,47 @@ export default function App() {
             {mode === 'area' && !detail && hasGeo && <div className="hint">Klik sebuah wilayah di peta untuk melihat detailnya.</div>}
           </section>
 
+          <section className="card">
+            <div className="card-h">Dampak: area terbakar & penduduk</div>
+            <p className="card-d">Bandingkan titik panas dengan luas bekas terbakar (MODIS MCD64A1) dan perkirakan penduduk terdampak (WorldPop). Dihitung di Google Earth Engine, butuh beberapa detik. Pilih wilayah atau radius lebih dulu.</p>
+            {!curKey ? <div className="hint">Belum ada wilayah atau radius terpilih.</div> : (
+              <>
+                <div className="imp-row"><span>Penduduk ≤ jarak dari titik panas</span>
+                  <div className="seg">{[2, 5, 10].map((k) => <button key={k} className={expKm === k ? 'on' : ''} onClick={() => setExpKm(k)}>{k} km</button>)}</div>
+                </div>
+                <div className="imp-row"><span>Area PM2.5 tinggi mulai</span>
+                  <select className="sel sm" value={pmThr} onChange={(e) => setPmThr(+e.target.value)} aria-label="Ambang PM2.5">
+                    <option value={55.5}>55,5 µg/m³ • Tidak sehat</option>
+                    <option value={150.5}>150,5 µg/m³ • Sangat tidak sehat</option>
+                  </select>
+                </div>
+                <div className="imp-btns">
+                  <button className="ghost" disabled={!!imp?.busy} onClick={() => calcImpact('burned')}>Hitung luas terbakar</button>
+                  <button className="ghost" disabled={!!imp?.busy} onClick={() => calcImpact('pop')}>Hitung penduduk terdampak</button>
+                </div>
+              </>
+            )}
+            {imp && (
+              <div className="result">
+                <div className="stat"><span>Titik panas ({days} hari, filter aktif)</span><b>{nf.format(imp.nFire)}</b></div>
+                {imp.burned != null && (
+                  <>
+                    <div className="stat"><span>Luas bekas terbakar (±120 hari)</span><b>{nf.format(Math.round(imp.burned))} ha</b></div>
+                    {imp.nFire > 0 && <div className="stat"><span>≈ per titik panas</span><b>{nf.format(Math.round(imp.burned / imp.nFire))} ha</b></div>}
+                  </>
+                )}
+                {imp.popFire != null && <div className="stat"><span>Penduduk ≤ {imp.expKm} km dari titik panas</span><b>{nf.format(Math.round(imp.popFire))} jiwa</b></div>}
+                {imp.popPm !== undefined && <div className="stat"><span>Penduduk di area PM2.5 ≥ {fmtId(imp.thr ?? 0)}</span><b>{imp.popPm == null ? 'data belum siap' : `${nf.format(Math.round(imp.popPm))} jiwa`}</b></div>}
+                {imp.busy && <div className="hint">Menghitung…</div>}
+                {imp.err && <div className="err">{imp.err}</div>}
+              </div>
+            )}
+            <p className="note">
+              Jangka waktu tidak sama: titik panas = {days} hari terakhir, area terbakar = komposit bulanan ±120 hari, jadi rasio ha per titik hanya indikatif.
+              Penduduk: WorldPop 100 m (tahun 2020), dihitung di sekitar maksimal 400 klaster titik panas teratas. Area PM2.5 tinggi memakai sel kecil dari medan CAMS jam terpilih (±45 km), sehingga bisa sedikit melewati batas wilayah. Semuanya perkiraan.
+            </p>
+          </section>
+
           {infoOpen && (
           <div className="modal-bg" onClick={() => setInfoOpen(false)}>
           <section className="card modal" role="dialog" aria-modal="true" aria-label="Sumber data dan cara penghitungan" onClick={(e) => e.stopPropagation()}>
@@ -1840,6 +2279,17 @@ export default function App() {
               <summary>Plume asap & jejak asap per jam</summary>
               <p><b>Plume:</b> simulasi visual. Ribuan partikel dilepas dari titik api (titik ber-FRP besar lebih sering, dibobot √FRP), dibawa angin jam terpilih, dan makin menyebar seiring umur. Kepadatan partikel dijumlahkan per sel layar lalu diwarnai peach → magenta → ungu. Bukan pengukuran asap.</p>
               <p><b>Jejak per jam:</b> dari titik api terbesar, posisi digeser angin jam demi jam (kecepatan km/j × 1 jam, dikonversi ke derajat dengan koreksi lintang), maksimal 24 jam ke depan. Arah asap dominan = rata-rata vektor angin di titik api, dibobot √FRP.</p>
+            </details>
+            <details className="src">
+              <summary>ISPU (kategori Indonesia)</summary>
+              <p><b>Dasar:</b> Permen LHK No. P.14/MENLHK/SETJEN/KUM.1/7/2020. Kategori: 0–50 Baik, 51–100 Sedang, 101–200 Tidak sehat, 201–300 Sangat tidak sehat, di atas 300 Berbahaya.</p>
+              <p><b>Penghitungan:</b> konsentrasi PM2.5 / PM10 diubah menjadi angka ISPU dengan interpolasi linear antar batas (PM2.5: 15,5 / 55,4 / 150,4 / 250,4 µg/m³ untuk ISPU 50 / 100 / 200 / 300; PM10: 50 / 150 / 350 / 420). ISPU resmi memakai rata-rata 24 jam dari stasiun pemantau. Di sini nilai berasal dari model CAMS per jam, jadi hanya perkiraan dan bukan angka resmi KLHK.</p>
+            </details>
+            <details className="src">
+              <summary>CO, area terbakar, dan penduduk (Google Earth Engine)</summary>
+              <p><b>CO:</b> Sentinel-5P TROPOMI, kolom total karbon monoksida (mol/m²), komposit beberapa hari terakhir.</p>
+              <p><b>Area terbakar:</b> MODIS MCD64A1 (500 m, bulanan), piksel yang terdeteksi terbakar dalam ±120 hari terakhir. Produk ini tertunda 1–2 bulan sehingga kebakaran terbaru belum muncul. Luas (ha) dijumlahkan dari luas piksel di dalam wilayah.</p>
+              <p><b>Penduduk:</b> WorldPop 100 m (Indonesia, 2020) dijumlahkan di dalam lingkaran di sekitar titik panas atau di sel area PM2.5 tinggi. Ini perkiraan paparan, bukan data jumlah korban.</p>
             </details>
             <details className="src">
               <summary>Batas wilayah & basemap</summary>
