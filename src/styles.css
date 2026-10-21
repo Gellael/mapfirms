@@ -546,3 +546,12 @@ body { font-size: 13.5px; }
 @media (max-width: 900px) and (max-height: 480px) { :root { --dock-h: calc(var(--peek) + 74px); } }
 @media (max-width: 520px) { .legends { width: 46vw; } }
 @media (pointer: coarse) { .map-actions { top: calc(var(--tb-h) + 62px); } .seg button { padding: 0 6px; } }
+
+/* legenda polutan tetap tersedia di layar kecil (variabel + sumber data) */
+@media (max-width: 520px) {
+  .legends { width: clamp(132px, calc(100vw - 192px), 220px); }
+  .aqlegend { display: block; padding: 8px 10px; }
+  .legends .seg.block { flex-direction: column; }
+  .legends .seg.block button { flex: none; padding: 7px 0; text-align: left; }
+  .aql-h { margin-bottom: 6px; }
+}
